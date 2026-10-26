@@ -5,7 +5,7 @@ import path from 'node:path';
 import { Agent, EnvHttpProxyAgent, FormData, fetch as undiciFetch } from 'undici';
 import { OzonError } from './errors.js';
 import { redact } from './privacy.js';
-import { afterSuccess, beforeRequest, rateLimitText } from './ratelimit.js';
+import { afterSuccess, beforeRequest, rateLimitText, shareInflight } from './ratelimit.js';
 import { enforceMode, validate } from './schema.js';
 import { findOperation, mediaSource } from './spec.js';
 
@@ -62,6 +62,10 @@ export function multipart(body) {
           stat = null;
         }
         if (!stat?.isFile()) throw new OzonError('上传字段必须为存在的本机文件绝对路径。');
+        // Only document/image types: a manipulated prompt must not ship key files or configs to Ozon.
+        if (!(path.extname(file).toLowerCase() in MIME)) {
+          throw new OzonError(`只允许上传以下类型的文件：${Object.keys(MIME).join(' ')}`);
+        }
         if (stat.size > 20_000_000) throw new OzonError('单个上传文件超过本服务 20 MB 限制。');
         total += stat.size;
         const name = path.basename(file).replace(/["\r\n]/g, '_');
@@ -83,8 +87,46 @@ export function multipart(body) {
   return form;
 }
 
-// int64 IDs beyond 2^53 are kept as exact strings where the runtime exposes the source text.
-function parseJson(text) {
+// int64 IDs beyond 2^53 must survive as exact strings, never as rounded numbers.
+let reviverHasSource = false;
+JSON.parse('1', (key, value, context) => {
+  reviverHasSource = typeof context?.source === 'string';
+  return value;
+});
+
+// Fallback for runtimes without reviver `context.source` (Node 20): quote unsafe integer
+// literals outside strings before parsing.
+export function quoteBigIntegers(text) {
+  let out = '';
+  let last = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+    if (inString) {
+      if (c === '\\') i += 1;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+    } else if (c === '-' || (c >= '0' && c <= '9')) {
+      let j = i + (c === '-' ? 1 : 0);
+      while (j < text.length && text[j] >= '0' && text[j] <= '9') j += 1;
+      const next = text[j];
+      const literal = text.slice(i, j);
+      if (next !== '.' && next !== 'e' && next !== 'E' && literal.replace('-', '').length >= 16
+          && !Number.isSafeInteger(Number(literal))) {
+        out += text.slice(last, i) + '"' + literal + '"';
+        last = j;
+      }
+      i = j - 1;
+    }
+  }
+  return last ? out + text.slice(last) : text;
+}
+
+export function parseJson(text) {
+  if (!reviverHasSource) return JSON.parse(quoteBigIntegers(text));
   return JSON.parse(text, (key, value, context) => {
     if (typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value)
         && typeof context?.source === 'string' && /^-?[0-9]+$/.test(context.source)) {
@@ -119,15 +161,22 @@ export async function request(endpoint, body = {}, method = 'POST') {
   body ??= {};
   validate(op.tool_name, body);
   const [clientId, apiKey] = credentials();
-  const cached = beforeRequest(op, body);
-  if (cached) return cached;
+  // Identical concurrent reads of a rate-limited endpoint share one request.
+  return shareInflight(op, body, () => beforeRequest(op, body) ?? send(op, body, clientId, apiKey));
+}
 
+async function send(op, body, clientId, apiKey) {
+  const endpoint = op.path;
   const headers = { 'Client-Id': clientId, 'Api-Key': apiKey, Accept: 'application/json', 'User-Agent': USER_AGENT };
-  let payload = JSON.stringify(body);
-  if (Buffer.byteLength(payload) > 2_000_000) throw new OzonError('请求体过大，请缩小查询范围。');
+  let payload;
   const [mediaType] = mediaSource(op);
-  if (mediaType === 'multipart/form-data') payload = multipart(body);
-  else headers['Content-Type'] = 'application/json';
+  if (mediaType === 'multipart/form-data') {
+    payload = multipart(body);
+  } else {
+    payload = JSON.stringify(body);
+    if (Buffer.byteLength(payload) > 2_000_000) throw new OzonError('请求体过大，请缩小查询范围。');
+    headers['Content-Type'] = 'application/json';
+  }
   if (op.method === 'GET') payload = undefined;
   if (op.tags.some((t) => OAUTH_TAGS.has(t))) {
     const token = (process.env.OZON_ACCESS_TOKEN ?? '').trim();

@@ -21,6 +21,10 @@ if (args.includes('--version') || args.includes('-v')) {
   HTTPS_PROXY                    代理（可选）
 `);
 } else {
+  // A stray error must not kill the server mid-conversation; log it to stderr and keep serving.
+  const report = (kind) => (error) => process.stderr.write(`[ozon-seller-mcp] ${kind}: ${error?.stack ?? error}\n`);
+  process.on('unhandledRejection', report('unhandledRejection'));
+  process.on('uncaughtException', report('uncaughtException'));
   try {
     const { main } = await import('../src/server.js');
     await main();

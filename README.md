@@ -108,7 +108,9 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 ## 隐私与安全
 
 - API Key 不出现在结果、错误信息和报告中
-- 订单结果默认去掉 `customer`、`addressee`、`address`、`phone`、`email`、`legal_info`
+- 所有结果默认去掉名为 `customer`、`addressee`、`address`、`phone`、`email`、`legal_info` 的字段（包括仓库地址、电话等非客户数据）
+- 写模式下上传文件只接受常见文档和图片类型（pdf、jpg、png、doc/xls 等），防止被诱导上传密钥或配置文件
+- 超过 2^53 的 int64 ID 以字符串原样返回，不会丢精度
 - 不跟随 HTTP 重定向，凭证不会发往其他主机
 - 只请求官方规范中登记的接口路径
 
@@ -116,7 +118,7 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 
 ```bash
 npm install
-npm test          # 21 个单元/契约测试，不联网
+npm test          # 26 个单元/契约测试，不联网
 npm run smoke     # 启动真实进程，跑一遍 MCP stdio 握手
 ```
 

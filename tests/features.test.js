@@ -151,3 +151,57 @@ test('multipart: strict base64 and absolute existing files only', () => {
   assert.throws(() => multipart({ files: ['relative.pdf'] }), /绝对路径/);
   assert.ok(multipart({ content: Buffer.from('hi').toString('base64'), note: 'x' }));
 });
+
+test('big int64 values survive as exact strings, also on the Node 20 fallback path', async () => {
+  const { quoteBigIntegers, parseJson } = await import('../src/http.js');
+  const text = '{"id":1020005028488300123,"s":"x 1020005028488300123 \\" 99999999999999999","small":42,"f":12345678901234567.5,"n":-9223372036854775807}';
+  const direct = JSON.parse(quoteBigIntegers(text));
+  assert.equal(direct.id, '1020005028488300123');
+  assert.equal(direct.s, 'x 1020005028488300123 " 99999999999999999');
+  assert.equal(direct.small, 42);
+  assert.equal(typeof direct.f, 'number');
+  assert.equal(direct.n, '-9223372036854775807');
+  assert.equal(parseJson(text).id, '1020005028488300123');
+});
+
+test('redact also hides a key that was configured with stray whitespace', async () => {
+  const { redact } = await import('../src/privacy.js');
+  await withEnv({ OZON_API_KEY: '  secret-key-123 \n' }, () => {
+    assert.equal(redact('upstream echoed secret-key-123'), 'upstream echoed [已隐藏密钥]');
+  });
+});
+
+test('uploads are limited to document and image types', async () => {
+  const { writeFileSync, mkdtempSync } = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ozon-up-'));
+  const key = path.join(dir, 'id_rsa');
+  const pdf = path.join(dir, 'cert.pdf');
+  writeFileSync(key, 'private');
+  writeFileSync(pdf, '%PDF');
+  assert.throws(() => multipart({ files: [key] }), /只允许上传/);
+  assert.ok(multipart({ files: [pdf] }));
+});
+
+test('identical concurrent reads of a rate-limited endpoint share one request', async () => {
+  await withEnv({}, async () => {
+    const calls = mockOzon({ '/v1/analytics/data': async () => ({ result: { data: [] } }) });
+    const body = { date_from: '2026-10-01', date_to: '2026-10-02', metrics: ['revenue'], dimension: ['day'], limit: 1 };
+    const [a, b] = await Promise.all([request('/v1/analytics/data', body), request('/v1/analytics/data', body)]);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(a.data, b.data);
+  });
+});
+
+test('capped orders overview keeps the newest postings', async () => {
+  await withEnv({}, async () => {
+    mockOzon({
+      '/v4/posting/fbs/list': (body) => ({ postings: [{ posting_number: body.filter.since, status: 'delivering',
+        in_process_at: body.filter.since, products: [] }], has_next: false }),
+    });
+    const out = parse(await callTool('ozon_orders_overview', { date_from: '2026-10-01', date_to: '2026-10-05', schemes: ['fbs'], max_postings: 2 }));
+    assert.equal(out.fbs.complete, false);
+    assert.deepEqual(out.recent_postings.map((p) => p.posting_number.slice(0, 10)), ['2026-10-05', '2026-10-04']);
+  });
+});

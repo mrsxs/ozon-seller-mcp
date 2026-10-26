@@ -76,10 +76,24 @@ export function beforeRequest(op, body, now = Date.now()) {
 }
 
 export function afterSuccess(op, body, result, now = Date.now()) {
-  if (op.read_only && RATE_LIMITS[op.path]?.windows) cache.set(cacheKey(op, body), { at: now, result });
+  if (!op.read_only || !RATE_LIMITS[op.path]?.windows) return;
+  for (const [key, entry] of cache) if (now - entry.at >= CACHE_TTL) cache.delete(key);
+  cache.set(cacheKey(op, body), { at: now, result });
+}
+
+const inflight = new Map();
+
+export function shareInflight(op, body, fn) {
+  if (!op.read_only || !RATE_LIMITS[op.path]?.windows) return Promise.resolve().then(fn);
+  const key = cacheKey(op, body);
+  if (!inflight.has(key)) {
+    inflight.set(key, Promise.resolve().then(fn).finally(() => inflight.delete(key)));
+  }
+  return inflight.get(key);
 }
 
 export function resetRateLimits() {
   history.clear();
   cache.clear();
+  inflight.clear();
 }

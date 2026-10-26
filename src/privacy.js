@@ -5,8 +5,11 @@ const SECRET_KEYS = new Set(['api-key', 'api_key', 'authorization']);
 export function redact(value) {
   if (typeof value === 'string') {
     for (const name of ['OZON_API_KEY', 'OZON_ACCESS_TOKEN']) {
-      const secret = process.env[name] ?? '';
-      if (secret) value = value.replaceAll(secret, '[已隐藏密钥]');
+      const raw = process.env[name] ?? '';
+      // The trimmed form is what actually goes on the wire.
+      for (const secret of new Set([raw, raw.trim()])) {
+        if (secret) value = value.replaceAll(secret, '[已隐藏密钥]');
+      }
     }
     return value;
   }

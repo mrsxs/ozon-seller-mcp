@@ -19,24 +19,40 @@ export function dropEmpty(value) {
 
 export const byteSize = (value) => Buffer.byteLength(JSON.stringify(value) ?? '');
 
-function arrays(node, path, found) {
+const skipped = (v) => v === undefined || typeof v === 'function' || typeof v === 'symbol';
+
+// Exact JSON byte size in one pass, recording every array with more than one item.
+function measure(node, path, found) {
   if (Array.isArray(node)) {
-    if (node.length > 1) found.push({ node, path, bytes: byteSize(node) });
-    node.forEach((item, i) => arrays(item, `${path}[${i}]`, found));
-  } else if (isObject(node)) {
-    for (const [k, v] of Object.entries(node)) arrays(v, `${path}.${k}`, found);
+    let size = 2 + Math.max(0, node.length - 1);
+    node.forEach((item, i) => {
+      size += skipped(item) ? 4 : measure(item, `${path}[${i}]`, found);
+    });
+    if (node.length > 1) found.push({ node, path, bytes: size });
+    return size;
   }
-  return found;
+  if (isObject(node)) {
+    let size = 2;
+    let fields = 0;
+    for (const [k, v] of Object.entries(node)) {
+      if (skipped(v)) continue;
+      size += byteSize(k) + 1 + measure(v, `${path}.${k}`, found);
+      fields += 1;
+    }
+    return size + Math.max(0, fields - 1);
+  }
+  return byteSize(node);
 }
 
 // Cut the largest arrays until the JSON fits; report exactly what was cut.
 export function fitToBudget(value, maxBytes) {
-  let size = byteSize(value);
-  if (size <= maxBytes) return { value, truncated: [] };
+  if (byteSize(value) <= maxBytes) return { value, truncated: [] };
   const data = structuredClone(value);
   const truncated = new Map();
+  let found = [];
+  let size = measure(data, '$', found);
   for (let round = 0; round < 30 && size > maxBytes; round += 1) {
-    const [largest] = arrays(data, '$', []).sort((a, b) => b.bytes - a.bytes);
+    const largest = found.sort((a, b) => b.bytes - a.bytes)[0];
     if (!largest) break;
     const { node, path, bytes } = largest;
     const total = truncated.get(path)?.total ?? node.length;
@@ -44,7 +60,8 @@ export function fitToBudget(value, maxBytes) {
     const keep = Math.max(1, Math.min(node.length - 1, Math.floor(node.length - (size - maxBytes) / perItem) - 1));
     node.length = keep;
     truncated.set(path, { path, kept: keep, total });
-    size = byteSize(data);
+    found = [];
+    size = measure(data, '$', found);
   }
   if (size > maxBytes) {
     const text = JSON.stringify(data);

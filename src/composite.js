@@ -368,31 +368,40 @@ const POSTING_CONCURRENCY = 4;
 
 async function fetchPostings(run, scheme, endpoint, period, statuses, maxPostings) {
   const started = performance.now();
-  const queue = windows(period);
+  // Newest windows first, so a capped run covers the most recent postings.
+  const queue = windows(period).reverse();
   const seen = new Map();
   let pages = 0;
   let capped = false;
+  let failure = null;
   async function worker() {
-    while (queue.length && !capped) {
-      const [since, to] = queue.shift();
-      const filter = { since, to, ...(statuses?.length ? { statuses } : {}) };
-      let cursor;
-      for (;;) {
-        if (seen.size >= maxPostings) {
-          capped = true;
-          return;
+    try {
+      while (queue.length && !capped && !failure) {
+        const [since, to] = queue.shift();
+        const filter = { since, to, ...(statuses?.length ? { statuses } : {}) };
+        let cursor;
+        while (!failure) {
+          if (seen.size >= maxPostings) {
+            capped = true;
+            return;
+          }
+          const data = await run.call(null, endpoint, { filter, limit: 100, ...(cursor ? { cursor } : {}) });
+          pages += 1;
+          for (const p of data?.postings ?? []) seen.set(p.posting_number, p);
+          if (!(data?.has_next && data?.cursor)) break;
+          cursor = data.cursor;
         }
-        const data = await run.call(null, endpoint, { filter, limit: 100, ...(cursor ? { cursor } : {}) });
-        pages += 1;
-        for (const p of data?.postings ?? []) seen.set(p.posting_number, p);
-        if (!(data?.has_next && data?.cursor)) break;
-        cursor = data.cursor;
       }
+    } catch (error) {
+      failure ??= error; // stop the other workers instead of letting them keep paging
     }
   }
   await Promise.all(Array.from({ length: Math.min(POSTING_CONCURRENCY, queue.length) }, worker));
+  if (failure) throw failure;
   run.timing_ms[`${scheme} 货件（${pages} 页）`] = Math.round(performance.now() - started);
-  return { postings: [...seen.values()].slice(0, maxPostings), complete: !capped && seen.size <= maxPostings };
+  const newestFirst = [...seen.values()].sort((a, b) =>
+    String(b.in_process_at ?? b.created_at ?? '').localeCompare(String(a.in_process_at ?? a.created_at ?? '')));
+  return { postings: newestFirst.slice(0, maxPostings), complete: !capped && seen.size <= maxPostings };
 }
 
 function summarize(postings) {

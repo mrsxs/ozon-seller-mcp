@@ -1,0 +1,43 @@
+{
+  "name": "ozon-seller-mcp",
+  "version": "2.0.0",
+  "description": "Ozon Seller API MCP server: 482 official endpoints, one-call composite queries, read-only by default, strict schema validation.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ozon",
+    "ozon-seller",
+    "accio"
+  ],
+  "homepage": "https://github.com/mrsxs/ozon-seller-mcp#readme",
+  "bugs": "https://github.com/mrsxs/ozon-seller-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrsxs/ozon-seller-mcp.git"
+  },
+  "type": "module",
+  "bin": {
+    "ozon-seller-mcp": "bin/ozon-seller-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "assets/",
+    "spec/openapi-ru.json",
+    "spec/operations.json",
+    "skills/",
+    "ozon-seller-assistant.skill"
+  ],
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "scripts": {
+    "test": "node --test",
+    "smoke": "node tests/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "ajv": "8.20.0",
+    "undici": "7.30.1"
+  }
+}

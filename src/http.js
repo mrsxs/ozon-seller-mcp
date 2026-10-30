@@ -17,9 +17,12 @@ const MAX_RESPONSE = 20_000_000;
 const HOST = new URL(BASE_URL).host;
 const PROXY_SCHEMES = new Set(['http:', 'https:', 'socks:', 'socks5:']);
 
+// Windows env names are case-insensitive, so https_proxy and HTTPS_PROXY are one variable there.
+const envLabel = (key) => (process.platform === 'win32' ? key.toUpperCase() : key);
+
 function firstDefined(...keys) {
   const key = keys.find((k) => process.env[k] !== undefined);
-  return key ? [key, process.env[key]] : null;
+  return key ? [envLabel(key), process.env[key]] : null;
 }
 
 // Mirrors undici's EnvHttpProxyAgent for an https:// target: `https_proxy ?? HTTPS_PROXY`,
@@ -97,7 +100,8 @@ export function describeNetworkError(error, elapsedMs) {
   } else if (CONNECT_CODES.has(code) || /proxy/i.test(detail)) {
     hint = proxy
       ? `经代理 ${proxy} 连接失败：确认代理软件正在运行、端口正确；不需要代理时从 MCP env 和系统环境变量删除它。`
-      : `无法直连 ${HOST}；如果本机要开代理才能访问，在 MCP env 加 "HTTPS_PROXY": "http://127.0.0.1:代理端口"。`;
+      : `无法直连 ${HOST}。用软路由/透明代理时，在路由器上把 ozon.ru 设为直连；`
+        + '如果本机要开代理软件才能访问，在 MCP env 加 "HTTPS_PROXY": "http://127.0.0.1:代理端口"。';
   }
   return `连接 Ozon 失败（${code}，${Math.round(elapsedMs)} ms，代理：${proxy ?? '未设置，直连'}）。${hint} 原始错误：${detail}`;
 }

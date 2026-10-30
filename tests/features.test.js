@@ -248,8 +248,11 @@ test('a malformed proxy variable is named instead of a generic timeout', async (
 test('reported proxy follows undici precedence and never hides the real cause', async () => {
   const status = async () => parse(await callTool('ozon_status', {})).proxy;
   // An empty https_proxy stops the HTTPS chain, so undici falls back to http_proxy.
-  await withEnv({ https_proxy: '', HTTPS_PROXY: 'http://127.0.0.1:1', HTTP_PROXY: 'http://127.0.0.1:2' },
-    async () => assert.equal(await status(), 'HTTP_PROXY=http://127.0.0.1:2'));
+  // Windows env names are case-insensitive, so the two spellings cannot differ there.
+  if (process.platform !== 'win32') {
+    await withEnv({ https_proxy: '', HTTPS_PROXY: 'http://127.0.0.1:1', HTTP_PROXY: 'http://127.0.0.1:2' },
+      async () => assert.equal(await status(), 'HTTP_PROXY=http://127.0.0.1:2'));
+  }
   await withEnv({ HTTPS_PROXY: 'socks5://127.0.0.1:1080', NO_PROXY: '.ozon.ru' },
     async () => assert.equal(await status(), 'HTTPS_PROXY=socks5://127.0.0.1:1080（NO_PROXY=.ozon.ru）'));
   await withEnv({ HTTPS_PROXY: 'http://127.0.0.1:7890', HTTP_PROXY: 'localhost:7890' }, async () => {

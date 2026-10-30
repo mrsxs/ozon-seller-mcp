@@ -14,15 +14,92 @@ const USER_AGENT = 'Ozon-Seller-MCP/2.0';
 const OAUTH_TAGS = new Set(['DeliveryAPI', 'OrderAPI', 'FboPostingAPI', 'CancelReasonAPI']);
 const MAX_RESPONSE = 20_000_000;
 
-let dispatcher;
-function getDispatcher() {
-  if (!dispatcher) {
-    // A TLS handshake to Ozon costs 1.5-2 s from China; keep sockets for reuse between tool calls.
-    const options = { keepAliveTimeout: 60_000, keepAliveMaxTimeout: 600_000, headersTimeout: 60_000, bodyTimeout: 60_000, connections: 8 };
-    const proxied = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'].some((k) => process.env[k]);
-    dispatcher = proxied ? new EnvHttpProxyAgent(options) : new Agent(options);
+const HOST = new URL(BASE_URL).host;
+const PROXY_SCHEMES = new Set(['http:', 'https:', 'socks:', 'socks5:']);
+
+function firstDefined(...keys) {
+  const key = keys.find((k) => process.env[k] !== undefined);
+  return key ? [key, process.env[key]] : null;
+}
+
+// Mirrors undici's EnvHttpProxyAgent for an https:// target: `https_proxy ?? HTTPS_PROXY`,
+// falling back to `http_proxy ?? HTTP_PROXY` when that is empty. An empty string stops a chain.
+function proxyEnv() {
+  const https = firstDefined('https_proxy', 'HTTPS_PROXY');
+  const http = firstDefined('http_proxy', 'HTTP_PROXY');
+  const set = [https, http].filter((entry) => entry?.[1]);
+  return { set, active: set[0] ?? null, noProxy: (firstDefined('no_proxy', 'NO_PROXY')?.[1] ?? '').trim() };
+}
+
+// scheme://host:port only; credentials in a proxy URL never reach a result.
+function describeProxy([key, raw]) {
+  try {
+    const url = new URL(raw.trim());
+    if (PROXY_SCHEMES.has(url.protocol) && url.host) return { valid: true, text: `${key}=${url.protocol}//${url.host}` };
+  } catch {
+    // reported as invalid below
   }
+  return { valid: false, text: `${key}=（格式无效，应为 http://主机:端口）` };
+}
+
+export function proxySummary() {
+  const { active, noProxy } = proxyEnv();
+  if (!active) return null;
+  const text = describeProxy(active).text;
+  return noProxy ? `${text}（NO_PROXY=${noProxy.slice(0, 100)}）` : text;
+}
+
+let dispatcher;
+let dispatcherKey;
+function getDispatcher() {
+  const env = proxyEnv();
+  const key = JSON.stringify(env);
+  if (dispatcher && key === dispatcherKey) return dispatcher;
+  // undici builds an agent for every proxy variable that is set, so each one must parse.
+  const invalid = env.set.map(describeProxy).filter((p) => !p.valid);
+  if (invalid.length) {
+    throw new OzonError(`代理配置无效（${invalid.map((p) => p.text).join('；')}）。请改为 http://127.0.0.1:端口 这种格式，或删除该环境变量后重启 MCP。`);
+  }
+  // A TLS handshake to Ozon costs 1.5-2 s from China; keep sockets for reuse between tool calls.
+  const options = { keepAliveTimeout: 60_000, keepAliveMaxTimeout: 600_000, headersTimeout: 60_000, bodyTimeout: 60_000, connections: 8 };
+  let next;
+  try {
+    next = env.set.length ? new EnvHttpProxyAgent(options) : new Agent(options);
+  } catch (error) {
+    throw new OzonError(`代理配置无效（${env.set.map((p) => describeProxy(p).text).join('；')}）：${error.message}`);
+  }
+  dispatcher?.close().catch(() => {});
+  dispatcher = next;
+  dispatcherKey = key;
   return dispatcher;
+}
+
+const CERT_CODE = /CERT|SELF_SIGNED|UNABLE_TO_(GET|VERIFY)|ERR_TLS|ERR_SSL|DEPTH_ZERO/;
+const CONNECT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNRESET', 'ENETUNREACH',
+  'EHOSTUNREACH', 'UND_ERR_SOCKET', 'EPIPE']);
+
+// fetch() only says "fetch failed"; the cause is what tells a seller what to fix on their machine.
+export function describeNetworkError(error, elapsedMs) {
+  const cause = error?.cause?.code || error?.cause?.message || error?.cause?.errors ? error.cause : error;
+  const code = String(cause?.code ?? cause?.name ?? 'UNKNOWN');
+  // Happy Eyeballs failures arrive as an AggregateError with an empty message; the per-address errors carry the detail.
+  const parts = [cause?.message, ...(Array.isArray(cause?.errors) ? cause.errors.map((e) => e?.message) : [])].filter(Boolean);
+  const detail = redact(parts.join('; ') || String(error)).replace(/\/\/[^/@\s]+@/g, '//***@').slice(0, 300);
+  const proxy = proxySummary();
+  let hint = '';
+  if (CERT_CODE.test(code) || /certificate/i.test(detail)) {
+    hint = 'HTTPS 证书校验失败，通常是杀毒/安全软件、软路由 HTTPS 过滤或公司网关在做 HTTPS 扫描。关闭该功能，'
+      + '或在 MCP env 加 "NODE_OPTIONS": "--use-system-ca"（Node ≥ 22.15）后重启 MCP。';
+  } else if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+    hint = `本机解析不到 ${HOST}，检查 DNS 或代理软件的规则。`;
+  } else if (code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT') {
+    hint = 'Ozon 60 秒内未返回数据，稍后再试或缩小查询范围。';
+  } else if (CONNECT_CODES.has(code) || /proxy/i.test(detail)) {
+    hint = proxy
+      ? `经代理 ${proxy} 连接失败：确认代理软件正在运行、端口正确；不需要代理时从 MCP env 和系统环境变量删除它。`
+      : `无法直连 ${HOST}；如果本机要开代理才能访问，在 MCP env 加 "HTTPS_PROXY": "http://127.0.0.1:代理端口"。`;
+  }
+  return `连接 Ozon 失败（${code}，${Math.round(elapsedMs)} ms，代理：${proxy ?? '未设置，直连'}）。${hint} 原始错误：${detail}`;
 }
 
 let fetchImpl = undiciFetch;
@@ -161,11 +238,13 @@ export async function request(endpoint, body = {}, method = 'POST') {
   body ??= {};
   validate(op.tool_name, body);
   const [clientId, apiKey] = credentials();
+  // A broken proxy setting fails here, before a local rate-limit slot is taken.
+  const agent = getDispatcher();
   // Identical concurrent reads of a rate-limited endpoint share one request.
-  return shareInflight(op, body, () => beforeRequest(op, body) ?? send(op, body, clientId, apiKey));
+  return shareInflight(op, body, () => beforeRequest(op, body) ?? send(op, body, clientId, apiKey, agent));
 }
 
-async function send(op, body, clientId, apiKey) {
+async function send(op, body, clientId, apiKey, agent) {
   const endpoint = op.path;
   const headers = { 'Client-Id': clientId, 'Api-Key': apiKey, Accept: 'application/json', 'User-Agent': USER_AGENT };
   let payload;
@@ -189,12 +268,14 @@ async function send(op, body, clientId, apiKey) {
   // Writes are never automatically retried after an ambiguous outcome.
   for (let attempt = 0; attempt < (op.read_only ? 2 : 1); attempt += 1) {
     let response;
+    const sentAt = performance.now();
     try {
       response = await fetchImpl(BASE_URL + endpoint, {
-        method: op.method, headers, body: payload, redirect: 'manual', dispatcher: getDispatcher(),
+        method: op.method, headers, body: payload, redirect: 'manual', dispatcher: agent,
       });
-    } catch {
-      throw new OzonError('连接 Ozon 失败或超时。' + (op.read_only ? '' : '写入结果未知，请先查询业务状态，不要自动重试。'));
+    } catch (error) {
+      throw new OzonError(describeNetworkError(error, performance.now() - sentAt)
+        + (op.read_only ? '' : ' 写入结果未知，请先查询业务状态，不要自动重试。'));
     }
     if (response.status >= 300 && response.status < 400) {
       await response.body?.cancel().catch(() => {});

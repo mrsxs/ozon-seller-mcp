@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { dropEmpty, fitToBudget } from '../src/compact.js';
 import { RateLimitError } from '../src/errors.js';
-import { multipart, request } from '../src/http.js';
+import { multipart, request, setFetchForTests } from '../src/http.js';
 import { afterSuccess, beforeRequest } from '../src/ratelimit.js';
 import { callTool, listTools } from '../src/tools.js';
 import { json, mockOzon, parse, withEnv } from './helpers.js';
@@ -203,5 +203,64 @@ test('capped orders overview keeps the newest postings', async () => {
     const out = parse(await callTool('ozon_orders_overview', { date_from: '2026-10-01', date_to: '2026-10-05', schemes: ['fbs'], max_postings: 2 }));
     assert.equal(out.fbs.complete, false);
     assert.deepEqual(out.recent_postings.map((p) => p.posting_number.slice(0, 10)), ['2026-10-05', '2026-10-04']);
+  });
+});
+
+const failWith = (code, message) => setFetchForTests(async () => {
+  throw new TypeError('fetch failed', { cause: Object.assign(new Error(message), { code }) });
+});
+
+test('connection failures report the underlying cause and a fix', async () => {
+  await withEnv({}, async () => {
+    failWith('SELF_SIGNED_CERT_IN_CHAIN', 'self-signed certificate in certificate chain');
+    await assert.rejects(request('/v1/seller/info', {}), /SELF_SIGNED_CERT_IN_CHAIN.*直连.*--use-system-ca/s);
+  });
+  await withEnv({ HTTPS_PROXY: 'http://user:secret@127.0.0.1:7899' }, async () => {
+    failWith('ECONNREFUSED', 'connect ECONNREFUSED 127.0.0.1:7899');
+    await assert.rejects(request('/v1/seller/info', {}), (error) => {
+      assert.match(error.message, /ECONNREFUSED.*HTTPS_PROXY=http:\/\/127\.0\.0\.1:7899.*代理软件正在运行/s);
+      assert.doesNotMatch(error.message, /secret/);
+      return true;
+    });
+  });
+  await withEnv({ OZON_API_KEY: 'k-123' }, async () => {
+    failWith('UND_ERR_CONNECT_TIMEOUT', 'Connect Timeout Error k-123');
+    await assert.rejects(request('/v1/seller/info', {}), (error) => {
+      assert.match(error.message, /UND_ERR_CONNECT_TIMEOUT.*HTTPS_PROXY/s);
+      assert.doesNotMatch(error.message, /k-123/);
+      return true;
+    });
+  });
+});
+
+test('a malformed proxy variable is named instead of a generic timeout', async () => {
+  await withEnv({ HTTPS_PROXY: '127.0.0.1:7890' }, async () => {
+    let network = 0;
+    setFetchForTests(async () => { network += 1; return json({}); });
+    await assert.rejects(request('/v1/seller/info', {}), /代理配置无效（HTTPS_PROXY=（格式无效/);
+    assert.equal(network, 0);
+    const status = parse(await callTool('ozon_status', {}));
+    assert.match(status.proxy, /格式无效/);
+    assert.equal(status.node, process.version);
+  });
+});
+
+test('reported proxy follows undici precedence and never hides the real cause', async () => {
+  const status = async () => parse(await callTool('ozon_status', {})).proxy;
+  // An empty https_proxy stops the HTTPS chain, so undici falls back to http_proxy.
+  await withEnv({ https_proxy: '', HTTPS_PROXY: 'http://127.0.0.1:1', HTTP_PROXY: 'http://127.0.0.1:2' },
+    async () => assert.equal(await status(), 'HTTP_PROXY=http://127.0.0.1:2'));
+  await withEnv({ HTTPS_PROXY: 'socks5://127.0.0.1:1080', NO_PROXY: '.ozon.ru' },
+    async () => assert.equal(await status(), 'HTTPS_PROXY=socks5://127.0.0.1:1080（NO_PROXY=.ozon.ru）'));
+  await withEnv({ HTTPS_PROXY: 'http://127.0.0.1:7890', HTTP_PROXY: 'localhost:7890' }, async () => {
+    await assert.rejects(request('/v1/seller/info', {}), /代理配置无效（HTTP_PROXY=（格式无效/);
+  });
+  await withEnv({}, async () => {
+    setFetchForTests(async () => {
+      const errors = [Object.assign(new Error('connect ETIMEDOUT 185.73.194.107:443'), { code: 'ETIMEDOUT' }),
+        Object.assign(new Error('connect ETIMEDOUT 185.73.193.82:443'), { code: 'ETIMEDOUT' })];
+      throw new TypeError('fetch failed', { cause: Object.assign(new AggregateError(errors, ''), { code: 'ETIMEDOUT' }) });
+    });
+    await assert.rejects(request('/v1/seller/info', {}), /ETIMEDOUT.*185\.73\.194\.107:443; connect ETIMEDOUT 185\.73\.193\.82/s);
   });
 });

@@ -46,6 +46,19 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 
 修改后需要重启 MCP。
 
+## 连不上 Ozon
+
+报错会写明底层原因、耗时和当前代理，例如 `连接 Ozon 失败（ECONNREFUSED，8 ms，代理：HTTPS_PROXY=http://127.0.0.1:7899）`。`ozon_status` 会显示 Node 版本和生效的代理。
+
+| 报错里的原因 | 处理 |
+|---|---|
+| `代理配置无效` | 代理变量缺少协议，改成 `http://127.0.0.1:端口` |
+| 带代理的 `ECONNREFUSED` / `UND_ERR_CONNECT_TIMEOUT` | 代理软件没开或端口不对；不需要代理就删掉该变量 |
+| 直连的 `UND_ERR_CONNECT_TIMEOUT` / `ECONNRESET` | 本机直连不通。浏览器能开 Ozon 是因为走了系统代理，Node 不读系统代理，需要在 `env` 加 `"HTTPS_PROXY": "http://127.0.0.1:代理端口"` |
+| `SELF_SIGNED_CERT_IN_CHAIN` 等证书错误 | 杀毒软件或公司网关在扫描 HTTPS。关闭 HTTPS 扫描，或在 `env` 加 `"NODE_OPTIONS": "--use-system-ca"`（Node ≥ 22.15） |
+| `ENOTFOUND` | DNS 解析失败 |
+| `HTTP 401/403` | 网络已通，检查 Client ID、API Key 和权限 |
+
 ## 工具
 
 ### 组合工具（一次调用）

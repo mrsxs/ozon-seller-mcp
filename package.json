@@ -1,6 +1,6 @@
 {
   "name": "ozon-seller-mcp",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Ozon Seller API MCP server: 482 official endpoints, one-call composite queries, read-only by default, strict schema validation.",
   "keywords": [
     "mcp",

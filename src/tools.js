@@ -1,7 +1,7 @@
 import { compactEnabled, maxResultBytes, readOnlyMode, toolsetSpec } from './config.js';
 import { COMPOSITE_TOOLS } from './composite.js';
 import { dropEmpty, fitToBudget } from './compact.js';
-import { request } from './http.js';
+import { proxySummary, request } from './http.js';
 import { hidePersonal, redact } from './privacy.js';
 import { rateLimitText } from './ratelimit.js';
 import { renderReport } from './reports.js';
@@ -34,7 +34,7 @@ function metaTools() {
   const method = { type: 'string', enum: ['GET', 'POST'], default: 'POST' };
   const body = { type: 'object', description: '严格遵循该接口官方 requestBody；不得传入 API Key 或 Client-Id。' };
   return [
-    { name: 'ozon_status', description: '查询本机 MCP 运行模式、工具集、接口覆盖数与凭证是否配置；不联网、不回显密钥。',
+    { name: 'ozon_status', description: '查询本机 MCP 运行模式、工具集、接口覆盖数、凭证是否配置、Node 版本与代理设置；不联网、不回显密钥。',
       inputSchema: schema({}), annotations: annotations(true, true) },
     { name: 'ozon_api_catalog', description: '分页搜索全部 482 个官方接口（名称/路径/分组）及只读分类、限流说明；不发送业务请求。未出现在工具列表里的接口用 ozon_api_call 调用。',
       inputSchema: schema({ query: { type: 'string', default: '' }, offset: { type: 'integer', minimum: 0, default: 0 },
@@ -160,6 +160,7 @@ async function execute(name, args) {
         available_api_operations: [...OPERATIONS.values()].filter((o) => !readOnly || o.read_only).length,
         compact_results: compactEnabled(), max_result_kb: Math.round(maxResultBytes() / 1024),
         source_date: CATALOG.source_date, source_version: CATALOG.source_version,
+        node: process.version, platform: process.platform, proxy: proxySummary(),
       };
     }
     case 'ozon_api_catalog':

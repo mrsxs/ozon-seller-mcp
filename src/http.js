@@ -2,15 +2,16 @@
 // keep-alive connection reuse, local rate-limit protection.
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { Agent, EnvHttpProxyAgent, FormData, fetch as undiciFetch } from 'undici';
+import { Agent, EnvHttpProxyAgent, FormData, ProxyAgent, fetch as undiciFetch } from 'undici';
 import { OzonError } from './errors.js';
 import { redact } from './privacy.js';
 import { afterSuccess, beforeRequest, rateLimitText, shareInflight } from './ratelimit.js';
 import { enforceMode, validate } from './schema.js';
 import { findOperation, mediaSource } from './spec.js';
+import { VlessConfigError, describeVless, isVlessLink, parseVless, vlessConnector } from './vless.js';
 
 export const BASE_URL = 'https://api-seller.ozon.ru';
-const USER_AGENT = 'Ozon-Seller-MCP/2.0';
+const USER_AGENT = 'Ozon-Seller-MCP/2.1';
 const OAUTH_TAGS = new Set(['DeliveryAPI', 'OrderAPI', 'FboPostingAPI', 'CancelReasonAPI']);
 const MAX_RESPONSE = 20_000_000;
 
@@ -25,17 +26,30 @@ function firstDefined(...keys) {
   return key ? [envLabel(key), process.env[key]] : null;
 }
 
-// Mirrors undici's EnvHttpProxyAgent for an https:// target: `https_proxy ?? HTTPS_PROXY`,
+// OZON_PROXY, when non-empty, is used for Ozon alone and wins over the standard variables.
+// Otherwise this mirrors undici's EnvHttpProxyAgent for an https:// target: `https_proxy ?? HTTPS_PROXY`,
 // falling back to `http_proxy ?? HTTP_PROXY` when that is empty. An empty string stops a chain.
 function proxyEnv() {
+  const ozon = (process.env.OZON_PROXY ?? '').trim();
+  if (ozon) return { set: [['OZON_PROXY', ozon]], active: ['OZON_PROXY', ozon], noProxy: '', ozon: true };
   const https = firstDefined('https_proxy', 'HTTPS_PROXY');
   const http = firstDefined('http_proxy', 'HTTP_PROXY');
   const set = [https, http].filter((entry) => entry?.[1]);
   return { set, active: set[0] ?? null, noProxy: (firstDefined('no_proxy', 'NO_PROXY')?.[1] ?? '').trim() };
 }
 
-// scheme://host:port only; credentials in a proxy URL never reach a result.
+// scheme://host:port only; credentials in a proxy URL (or a vless UUID) never reach a result.
 function describeProxy([key, raw]) {
+  if (isVlessLink(raw)) {
+    if (key !== 'OZON_PROXY') return { valid: false, text: `${key}=（vless 节点请填在 OZON_PROXY）` };
+    try {
+      const vless = parseVless(raw);
+      return { valid: true, text: `${key}=${describeVless(vless)}`, vless };
+    } catch (error) {
+      if (error instanceof VlessConfigError) return { valid: false, text: `${key}=（${error.message}）` };
+      throw error;
+    }
+  }
   try {
     const url = new URL(raw.trim());
     if (PROXY_SCHEMES.has(url.protocol) && url.host) return { valid: true, text: `${key}=${url.protocol}//${url.host}` };
@@ -54,25 +68,37 @@ export function proxySummary() {
 
 let dispatcher;
 let dispatcherKey;
+let releaseNode;
 function getDispatcher() {
   const env = proxyEnv();
   const key = JSON.stringify(env);
   if (dispatcher && key === dispatcherKey) return dispatcher;
   // undici builds an agent for every proxy variable that is set, so each one must parse.
-  const invalid = env.set.map(describeProxy).filter((p) => !p.valid);
+  const described = env.set.map(describeProxy);
+  const invalid = described.filter((p) => !p.valid);
   if (invalid.length) {
-    throw new OzonError(`代理配置无效（${invalid.map((p) => p.text).join('；')}）。请改为 http://127.0.0.1:端口 这种格式，或删除该环境变量后重启 MCP。`);
+    throw new OzonError(`代理配置无效（${invalid.map((p) => p.text).join('；')}）。支持 vless://（WebSocket 节点，仅 OZON_PROXY）、`
+      + 'http://主机:端口、socks5://主机:端口；不需要代理就把该变量留空，然后重启 MCP。');
   }
   // A TLS handshake to Ozon costs 1.5-2 s from China; keep sockets for reuse between tool calls.
   const options = { keepAliveTimeout: 60_000, keepAliveMaxTimeout: 600_000, headersTimeout: 60_000, bodyTimeout: 60_000, connections: 8 };
   let next;
+  let connector;
   try {
-    next = env.set.length ? new EnvHttpProxyAgent(options) : new Agent(options);
+    if (env.ozon) {
+      const { vless } = described[0];
+      if (vless) connector = vlessConnector(vless);
+      next = connector ? new Agent({ ...options, connect: connector }) : new ProxyAgent({ ...options, uri: env.active[1] });
+    } else {
+      next = env.set.length ? new EnvHttpProxyAgent(options) : new Agent(options);
+    }
   } catch (error) {
     throw new OzonError(`代理配置无效（${env.set.map((p) => describeProxy(p).text).join('；')}）：${error.message}`);
   }
   dispatcher?.close().catch(() => {});
+  releaseNode?.();
   dispatcher = next;
+  releaseNode = connector?.close;
   dispatcherKey = key;
   return dispatcher;
 }
@@ -97,11 +123,14 @@ export function describeNetworkError(error, elapsedMs) {
     hint = `本机解析不到 ${HOST}，检查 DNS 或代理软件的规则。`;
   } else if (code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT') {
     hint = 'Ozon 60 秒内未返回数据，稍后再试或缩小查询范围。';
+  } else if (code.startsWith('VLESS_') || (CONNECT_CODES.has(code) && proxy?.includes('vless://'))) {
+    hint = 'VLESS 节点不可用：核对 OZON_PROXY 链接（UUID、host、path）是否完整、节点是否到期，可先在 v2rayN 等客户端里测速；'
+      + '也可换一个节点，或把 OZON_PROXY 留空改回直连。';
   } else if (CONNECT_CODES.has(code) || /proxy/i.test(detail)) {
     hint = proxy
-      ? `经代理 ${proxy} 连接失败：确认代理软件正在运行、端口正确；不需要代理时从 MCP env 和系统环境变量删除它。`
-      : `无法直连 ${HOST}。用软路由/透明代理时，在路由器上把 ozon.ru 设为直连；`
-        + '如果本机要开代理软件才能访问，在 MCP env 加 "HTTPS_PROXY": "http://127.0.0.1:代理端口"。';
+      ? `经代理 ${proxy} 连接失败：确认代理软件正在运行、端口正确；不需要代理时把该变量留空。`
+      : `无法直连 ${HOST}。国内网络直连 Ozon 经常不通（软路由下 TCP 几毫秒就“连上”、TLS 却超时也属于这种情况），`
+        + '在 MCP env 加 "OZON_PROXY"：vless:// 节点链接，或 http:// / socks5:// 代理地址，然后重启 MCP。';
   }
   return `连接 Ozon 失败（${code}，${Math.round(elapsedMs)} ms，代理：${proxy ?? '未设置，直连'}）。${hint} 原始错误：${detail}`;
 }

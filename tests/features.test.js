@@ -226,7 +226,7 @@ test('connection failures report the underlying cause and a fix', async () => {
   await withEnv({ OZON_API_KEY: 'k-123' }, async () => {
     failWith('UND_ERR_CONNECT_TIMEOUT', 'Connect Timeout Error k-123');
     await assert.rejects(request('/v1/seller/info', {}), (error) => {
-      assert.match(error.message, /UND_ERR_CONNECT_TIMEOUT.*HTTPS_PROXY/s);
+      assert.match(error.message, /UND_ERR_CONNECT_TIMEOUT.*OZON_PROXY/s);
       assert.doesNotMatch(error.message, /k-123/);
       return true;
     });

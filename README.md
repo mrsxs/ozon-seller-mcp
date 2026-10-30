@@ -42,9 +42,26 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 | `OZON_MAX_RESULT_KB` | `80` | 单次结果上限；超出时截断最大的数组并提示分页 |
 | `OZON_OUTPUT_DIR` | `~/.accio/outputs/ozon` | HTML 报告目录 |
 | `OZON_ACCESS_TOKEN` | — | Ozon Delivery 分组接口的 OAuth 令牌 |
-| `HTTPS_PROXY` | — | 设置后经代理访问 |
+| `OZON_PROXY` | 空 | 只给 Ozon 请求用的代理，留空就直连。支持 `vless://` 节点链接（WebSocket 类型）、`http://`、`socks5://`；设置后优先于 `HTTPS_PROXY` |
+| `HTTPS_PROXY` | — | 标准代理变量，`OZON_PROXY` 为空时生效 |
 
 修改后需要重启 MCP。
+
+## 通过节点访问 Ozon
+
+国内网络直连 Ozon 经常不通。把节点链接填进 `OZON_PROXY` 即可，不用另装代理软件：
+
+```json
+"env": {
+  "OZON_CLIENT_ID": "你的 Client ID",
+  "OZON_API_KEY": "你的 API Key",
+  "OZON_PROXY": "vless://UUID@地址:443?type=ws&security=tls&host=域名&sni=域名&path=%2Fws"
+}
+```
+
+- 支持 `type=ws`、`security=tls` 或 `none` 的 VLESS 节点（常见的 Cloudflare WS 节点）；Reality、gRPC、XTLS 等类型不支持，可用本机客户端转成 `http://127.0.0.1:端口` 再填
+- 到 Ozon 的 HTTPS 在隧道内端到端加密，节点只转发字节，看不到 API Key
+- 链接里的 UUID 等同节点密码，只放在 MCP 配置里，不要提交到仓库；`ozon_status` 和报错只显示节点地址，不显示 UUID
 
 ## 连不上 Ozon
 
@@ -54,7 +71,8 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 |---|---|
 | `代理配置无效` | 代理变量缺少协议，改成 `http://127.0.0.1:端口` |
 | 带代理的 `ECONNREFUSED` / `UND_ERR_CONNECT_TIMEOUT` | 代理软件没开或端口不对；不需要代理就删掉该变量 |
-| 直连的 `UND_ERR_CONNECT_TIMEOUT` / `ECONNRESET` | 本机直连不通。用软路由/透明代理的，在路由器上把 `ozon.ru` 设为直连（TCP 几毫秒就连上、TLS 握手却超时，就是路由器转发失败）；本机开代理软件的，Node 不读系统代理，需要在 `env` 加 `"HTTPS_PROXY": "http://127.0.0.1:代理端口"` |
+| 直连的 `UND_ERR_CONNECT_TIMEOUT` / `ECONNRESET` | 本机直连不通（软路由下 TCP 几毫秒就“连上”、TLS 握手却超时也属于这种）。在 `env` 配置 `OZON_PROXY`，见上一节；Node 不读系统代理，浏览器能打开不代表 MCP 能通 |
+| `VLESS_WS_FAILED` / 经 VLESS 节点的 `ECONNRESET` | 节点握手失败或 UUID 不对：核对链接里的 UUID、host、path，确认节点没过期 |
 | `SELF_SIGNED_CERT_IN_CHAIN` 等证书错误 | 杀毒软件或公司网关在扫描 HTTPS。关闭 HTTPS 扫描，或在 `env` 加 `"NODE_OPTIONS": "--use-system-ca"`（Node ≥ 22.15） |
 | `ENOTFOUND` | DNS 解析失败 |
 | `HTTP 401/403` | 网络已通，检查 Client ID、API Key 和权限 |

@@ -1,3 +1,6 @@
+import { CREDENTIAL_HELP, adsConfigured } from './ads/http.js';
+import { ADS_OPERATIONS, ADS_SOURCE } from './ads/spec.js';
+import { ADS_TOOL_MAP, listAdsTools } from './ads/tools.js';
 import { compactEnabled, maxResultBytes, readOnlyMode, toolsetSpec } from './config.js';
 import { COMPOSITE_TOOLS } from './composite.js';
 import { dropEmpty, fitToBudget } from './compact.js';
@@ -98,7 +101,7 @@ function makeTool(op) {
 const strip = ({ handler, ...tool }) => tool;
 
 export function listTools() {
-  return [...metaTools(), ...COMPOSITE_TOOLS.map(strip), ...selectedOperations().map(makeTool)];
+  return [...metaTools(), ...COMPOSITE_TOOLS.map(strip), ...listAdsTools(), ...selectedOperations().map(makeTool)];
 }
 
 // Called once at startup so configuration typos fail loudly instead of mid-conversation.
@@ -161,6 +164,11 @@ async function execute(name, args) {
         compact_results: compactEnabled(), max_result_kb: Math.round(maxResultBytes() / 1024),
         source_date: CATALOG.source_date, source_version: CATALOG.source_version,
         node: process.version, platform: process.platform, proxy: proxySummary(),
+        ads: {
+          credentials_configured: adsConfigured(), client_id: process.env.OZON_PERF_CLIENT_ID?.trim() || null,
+          official_operations: ADS_OPERATIONS.length, source_date: ADS_SOURCE.date, source_version: ADS_SOURCE.version,
+          setup_hint: adsConfigured() ? undefined : `广告工具（ozon_ads_stats 等）未启用。${CREDENTIAL_HELP}`,
+        },
       };
     }
     case 'ozon_api_catalog':
@@ -180,6 +188,7 @@ async function execute(name, args) {
       return renderReport(args.report, args.filename ?? 'ozon-report.html');
     default: {
       if (COMPOSITE.has(name)) return shrink(await COMPOSITE.get(name).handler(args));
+      if (ADS_TOOL_MAP.has(name)) return shrink(await ADS_TOOL_MAP.get(name).handler(args));
       const op = OPERATIONS.get(name);
       if (!op) throw new Error('未知工具。');
       enforceMode(op);
@@ -189,7 +198,7 @@ async function execute(name, args) {
 }
 
 function checkToolArguments(name, args) {
-  const tool = metaTools().find((t) => t.name === name) ?? COMPOSITE.get(name);
+  const tool = metaTools().find((t) => t.name === name) ?? COMPOSITE.get(name) ?? ADS_TOOL_MAP.get(name);
   if (!tool) return;
   const check = compileSchema('tool:' + name, tool.inputSchema);
   if (!check(args)) throw new Error(`工具参数校验失败；未执行操作。${formatErrors(check.errors, 3).join('；')}`);

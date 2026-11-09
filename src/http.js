@@ -69,7 +69,8 @@ export function proxySummary() {
 let dispatcher;
 let dispatcherKey;
 let releaseNode;
-function getDispatcher() {
+// Shared by the Seller and Performance (ads) transports: one proxy setting, one socket pool.
+export function getDispatcher() {
   const env = proxyEnv();
   const key = JSON.stringify(env);
   if (dispatcher && key === dispatcherKey) return dispatcher;
@@ -108,7 +109,7 @@ const CONNECT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ETIMEDOUT', 'ECONNREF
   'EHOSTUNREACH', 'UND_ERR_SOCKET', 'EPIPE']);
 
 // fetch() only says "fetch failed"; the cause is what tells a seller what to fix on their machine.
-export function describeNetworkError(error, elapsedMs) {
+export function describeNetworkError(error, elapsedMs, host = HOST) {
   const cause = error?.cause?.code || error?.cause?.message || error?.cause?.errors ? error.cause : error;
   const code = String(cause?.code ?? cause?.name ?? 'UNKNOWN');
   // Happy Eyeballs failures arrive as an AggregateError with an empty message; the per-address errors carry the detail.
@@ -120,7 +121,7 @@ export function describeNetworkError(error, elapsedMs) {
     hint = 'HTTPS 证书校验失败，通常是杀毒/安全软件、软路由 HTTPS 过滤或公司网关在做 HTTPS 扫描。关闭该功能，'
       + '或在 MCP env 加 "NODE_OPTIONS": "--use-system-ca"（Node ≥ 22.15）后重启 MCP。';
   } else if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
-    hint = `本机解析不到 ${HOST}，检查 DNS 或代理软件的规则。`;
+    hint = `本机解析不到 ${host}，检查 DNS 或代理软件的规则。`;
   } else if (code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT') {
     hint = 'Ozon 60 秒内未返回数据，稍后再试或缩小查询范围。';
   } else if (code.startsWith('VLESS_') || (CONNECT_CODES.has(code) && proxy?.includes('vless://'))) {
@@ -129,7 +130,7 @@ export function describeNetworkError(error, elapsedMs) {
   } else if (CONNECT_CODES.has(code) || /proxy/i.test(detail)) {
     hint = proxy
       ? `经代理 ${proxy} 连接失败：确认代理软件正在运行、端口正确；不需要代理时把该变量留空。`
-      : `无法直连 ${HOST}。国内网络直连 Ozon 经常不通（软路由下 TCP 几毫秒就“连上”、TLS 却超时也属于这种情况），`
+      : `无法直连 ${host}。国内网络直连 Ozon 经常不通（软路由下 TCP 几毫秒就“连上”、TLS 却超时也属于这种情况），`
         + '在 MCP env 加 "OZON_PROXY"：vless:// 节点链接，或 http:// / socks5:// 代理地址，然后重启 MCP。';
   }
   return `连接 Ozon 失败（${code}，${Math.round(elapsedMs)} ms，代理：${proxy ?? '未设置，直连'}）。${hint} 原始错误：${detail}`;
@@ -139,6 +140,7 @@ let fetchImpl = undiciFetch;
 export function setFetchForTests(fn) {
   fetchImpl = fn ?? undiciFetch;
 }
+export const currentFetch = () => fetchImpl;
 
 function credentials() {
   const clientId = (process.env.OZON_CLIENT_ID ?? '').trim();
@@ -246,7 +248,7 @@ export function parseJson(text) {
   });
 }
 
-async function readCapped(response) {
+export async function readCapped(response) {
   const chunks = [];
   let size = 0;
   for await (const chunk of response.body ?? []) {
@@ -260,7 +262,7 @@ async function readCapped(response) {
   return Buffer.concat(chunks);
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function request(endpoint, body = {}, method = 'POST') {
   const op = findOperation(endpoint, method);

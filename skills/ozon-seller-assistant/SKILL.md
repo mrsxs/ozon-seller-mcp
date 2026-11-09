@@ -1,6 +1,6 @@
 ---
 name: ozon-seller-assistant
-description: "通过 Ozon Seller MCP 查询和管理店铺商品、价格、库存、仓库、订单、退货、财务及促销，并将结果整理为清晰表格或离线 HTML 报告。用户提及 Ozon 店铺/API、库存查询、订单同步、财务对账或经营看板时使用。"
+description: "通过 Ozon Seller MCP 查询和管理店铺商品、价格、库存、仓库、订单、退货、财务、促销及广告数据（点击率、推广效果），并将结果整理为清晰表格或离线 HTML 报告。用户提及 Ozon 店铺/API、库存查询、订单同步、财务对账、广告点击率或经营看板时使用。"
 metadata:
   display_name: Ozon 店铺助手
   version: "2.0.0"
@@ -22,8 +22,16 @@ metadata:
 | 库存情况、缺货、低库存、补货清单 | `ozon_stock_overview` |
 | 最近订单/货件、发货状态、取消原因 | `ozon_orders_overview` |
 | 最近卖了多少、销量营收趋势、财务余额 | `ozon_sales_overview` |
+| 广告点击率、推广效果、哪个广告/商品亏钱（按点击付费） | `ozon_ads_stats` |
 
 组合工具结果含 `notes`（口径与缺失说明，需转告用户）和 `timing_ms`。底层接口失败时其余部分照常返回，在 notes 中说明。
+
+## 广告数据
+
+- 广告用独立的 Performance API 凭证（`OZON_PERF_CLIENT_ID` / `OZON_PERF_CLIENT_SECRET`）。`ozon_status` 的 `ads.credentials_configured=false` 时，告诉用户在卖家后台 设置 → API 密钥 → Performance API 创建服务账号和密钥，并填进 MCP env。
+- `ozon_ads_stats` 的 `flags` 是按阈值给的提示，`target_drr` 默认 30%：用户给出毛利率后用毛利率重算。展示少的商品不评判点击率，点击少的不评判转化。
+- 解读顺序：点击率低 → 主图/价格/标题；点击率正常但加购率低 → 详情页；加购正常但下单率低 → 价格与竞品；DRR 高于毛利率 → 降出价或停投。
+- 其他广告接口用 `ozon_ads_api_catalog` 搜索后 `ozon_ads_api_call` 调用；改出价、启停活动属于写操作，只读模式下会被拦截。
 
 ## 限流（必须告知用户）
 

@@ -108,6 +108,22 @@ export function transform(schema, refs, location = '$') {
   return result;
 }
 
+// Transforms `source` and every #/components/schemas entry it references (recursively) into $defs.
+// Shared by the Seller and Performance (ads) specs.
+export function withDefinitions(source, componentSchemas, location) {
+  const refs = new Set();
+  const result = transform(source, refs, location);
+  const definitions = {};
+  let pending;
+  while ((pending = [...refs].filter((r) => !(r in definitions))).length) {
+    for (const encoded of pending) {
+      const schemaName = encoded.replaceAll('~1', '/').replaceAll('~0', '~');
+      definitions[encoded] = transform(componentSchemas[schemaName], refs, '#/components/schemas/' + schemaName);
+    }
+  }
+  return Object.keys(definitions).length ? { ...result, $defs: definitions } : result;
+}
+
 const schemaCache = new Map();
 
 export function inputSchema(name) {
@@ -115,18 +131,8 @@ export function inputSchema(name) {
   const op = OPERATIONS.get(name);
   const [, media] = mediaSource(op);
   const source = media.schema || { type: 'object', properties: {}, additionalProperties: false };
-  const refs = new Set();
-  const result = transform(source, refs, op.path + '/requestBody');
-  const definitions = {};
-  let pending;
-  while ((pending = [...refs].filter((r) => !(r in definitions))).length) {
-    for (const encoded of pending) {
-      const schemaName = encoded.replaceAll('~1', '/').replaceAll('~0', '~');
-      definitions[encoded] = transform(SPEC.components.schemas[schemaName], refs, '#/components/schemas/' + schemaName);
-    }
-  }
-  if (Object.keys(definitions).length) result.$defs = definitions;
-  result.type ??= 'object';
+  const transformed = withDefinitions(source, SPEC.components.schemas, op.path + '/requestBody');
+  const result = { ...transformed, type: transformed.type ?? 'object' };
   schemaCache.set(name, result);
   return result;
 }
@@ -235,7 +241,7 @@ function knownProperties(schema, root, seen = new Set()) {
   return [properties, open];
 }
 
-function rejectUnknown(value, schema, root, location = '$') {
+export function rejectUnknown(value, schema, root, location = '$') {
   schema = expandLocal(schema, root);
   if (!isObject(schema)) return;
   if (isObject(value)) {

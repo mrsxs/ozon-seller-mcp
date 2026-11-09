@@ -1,10 +1,10 @@
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
-const SECRET_KEYS = new Set(['api-key', 'api_key', 'authorization']);
+const SECRET_KEYS = new Set(['api-key', 'api_key', 'authorization', 'client_secret', 'access_token']);
 
 // Keep credentials out of both upstream error text and tool results.
 export function redact(value) {
   if (typeof value === 'string') {
-    for (const name of ['OZON_API_KEY', 'OZON_ACCESS_TOKEN']) {
+    for (const name of ['OZON_API_KEY', 'OZON_ACCESS_TOKEN', 'OZON_PERF_CLIENT_SECRET']) {
       const raw = process.env[name] ?? '';
       // The trimmed form is what actually goes on the wire.
       for (const secret of new Set([raw, raw.trim()])) {

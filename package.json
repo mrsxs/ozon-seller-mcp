@@ -1,7 +1,7 @@
 {
   "name": "ozon-seller-mcp",
-  "version": "2.1.0",
-  "description": "Ozon Seller API MCP server: 482 official endpoints, one-call composite queries, read-only by default, strict schema validation.",
+  "version": "2.2.0",
+  "description": "Ozon Seller API + Performance (ads) API MCP server: 482 seller endpoints, 48 advertising endpoints, one-call composite queries, read-only by default, strict schema validation.",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -25,6 +25,8 @@
     "assets/",
     "spec/openapi-ru.json",
     "spec/operations.json",
+    "spec/performance-ru.json",
+    "spec/performance-zh.json",
     "skills/",
     "ozon-seller-assistant.skill"
   ],

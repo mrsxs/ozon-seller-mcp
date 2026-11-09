@@ -18,6 +18,8 @@ if (args.includes('--version') || args.includes('-v')) {
   OZON_MAX_RESULT_KB             单次结果上限，默认 80
   OZON_OUTPUT_DIR                HTML 报告输出目录
   OZON_ACCESS_TOKEN              Ozon Delivery 接口 OAuth 令牌（可选）
+  OZON_PERF_CLIENT_ID            广告 Performance API 的 Client ID（可选，查广告数据用）
+  OZON_PERF_CLIENT_SECRET        广告 Performance API 的 Client Secret
   OZON_PROXY                     只给 Ozon 用的代理：vless://（WS 节点）、http://、socks5://；留空直连
   HTTPS_PROXY                    标准代理变量，OZON_PROXY 为空时生效
 `);

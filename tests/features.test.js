@@ -142,7 +142,7 @@ test('rate-limited tools say so in their description', async () => {
 });
 
 test('OZON_TOOLSET accepts paths and rejects typos', async () => {
-  await withEnv({ OZON_TOOLSET: 'minimal,/v3/product/list' }, () => assert.equal(listTools().length, 13));
+  await withEnv({ OZON_TOOLSET: 'minimal,/v3/product/list' }, () => assert.equal(listTools().length, 16));
   await withEnv({ OZON_TOOLSET: 'cor' }, () => assert.throws(() => listTools(), /无法识别/));
 });
 

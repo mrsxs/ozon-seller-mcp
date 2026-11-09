@@ -68,14 +68,15 @@ test('mode-dependent tool lists and generic call gate', async () => {
   await withEnv({ OZON_READ_ONLY: 'true', OZON_TOOLSET: 'core' }, async () => {
     const names = new Set(listTools().map((t) => t.name));
     assert.ok(!names.has(stocks));
-    assert.equal(names.size, 25);
+    assert.equal(names.size, 28);
+    for (const name of ['ozon_ads_stats', 'ozon_ads_api_catalog', 'ozon_ads_api_call']) assert.ok(names.has(name), name);
     const blocked = await callTool('ozon_api_call', { endpoint: '/v2/products/stocks', body: { stocks: [] } });
     assert.equal(blocked.isError, true);
     assert.match(blocked.content[0].text, /OZON_READ_ONLY=true/);
   });
-  await withEnv({ OZON_READ_ONLY: 'true', OZON_TOOLSET: 'all' }, () => assert.equal(listTools().length, 6 + 6 + 268));
+  await withEnv({ OZON_READ_ONLY: 'true', OZON_TOOLSET: 'all' }, () => assert.equal(listTools().length, 6 + 6 + 3 + 268));
   await withEnv({ OZON_READ_ONLY: 'false', OZON_TOOLSET: 'all' }, async () => {
-    assert.equal(listTools().length, 6 + 6 + 482);
+    assert.equal(listTools().length, 6 + 6 + 3 + 482);
     const calls = mockOzon({ '/v2/products/stocks': () => ({ result: [{ updated: true }] }) });
     const result = await callTool(stocks, { stocks: [{ offer_id: 'a', product_id: 1, quant_size: 1, stock: 1, warehouse_id: 1 }] });
     assert.equal(result.isError, undefined, result.content[0].text);

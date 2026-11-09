@@ -10,7 +10,7 @@ const [command, ...args] = process.env.SMOKE_CMD
   : [process.execPath, path.join(root, 'bin', 'ozon-seller-mcp.js')];
 
 const child = spawn(command, args, {
-  env: { ...process.env, OZON_READ_ONLY: 'true', OZON_TOOLSET: 'core', OZON_CLIENT_ID: '', OZON_API_KEY: '' },
+  env: { ...process.env, OZON_READ_ONLY: 'true', OZON_TOOLSET: 'core', OZON_CLIENT_ID: '', OZON_API_KEY: '', OZON_PERF_CLIENT_ID: '', OZON_PERF_CLIENT_SECRET: '' },
   stdio: ['pipe', 'pipe', 'inherit'],
   shell: process.platform === 'win32' && command === 'npx',
 });
@@ -64,13 +64,14 @@ try {
   const { tools } = await rpc('tools/list');
   const names = new Set(tools.map((t) => t.name));
   for (const name of ['ozon_status', 'ozon_api_call', 'ozon_top_products', 'ozon_sales_overview']) assert(names.has(name), `missing ${name}`);
-  assert(tools.length === 25, `expected 25 core read-only tools, got ${tools.length}`);
+  assert(tools.length === 25, `expected 25 core read-only tools without ads credentials, got ${tools.length}`);
   const size = Buffer.byteLength(JSON.stringify(tools));
   assert(size < 60 * 1024, `tool list too large: ${size} bytes`);
 
   const status = JSON.parse((await rpc('tools/call', { name: 'ozon_status', arguments: {} })).content[0].text);
   assert(status.read_only === true && status.official_operations === 482, 'bad ozon_status');
   assert(status.api_key_configured === false, 'api key should be unset');
+  assert(status.ads?.official_operations === 60 && status.ads.credentials_configured === false, 'bad ads status');
 
   const blocked = await rpc('tools/call', { name: 'ozon_api_call', arguments: { endpoint: '/v2/products/stocks', body: { stocks: [] } } });
   assert(blocked.isError === true && blocked.content[0].text.includes('OZON_READ_ONLY'), 'write call must be blocked in read-only mode');

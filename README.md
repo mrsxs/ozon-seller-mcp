@@ -2,6 +2,8 @@
 
 Ozon 卖家 API 的标准 MCP 服务（stdio），纯 Node 实现，`npx` 即装即用，**不需要 Python**。
 
+- **广告数据**：接入 Ozon Performance API（广告后台）全部 48 个接口，`ozon_ads_stats` 一次调用出点击率/加购率/下单率/DRR 分析，见[广告数据](#广告数据performance-api)
+
 - 覆盖俄文官方 OpenAPI（2026-10-26 快照）全部 **482 个接口**，参数严格按官方 schema 校验
 - **6 个组合工具**：常见问题一次调用出结果（销量排行、商品列表、单品详情、库存、订单、经营概览）
 - **默认只读**；写操作在发送前拦截
@@ -42,6 +44,7 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 | `OZON_MAX_RESULT_KB` | `80` | 单次结果上限；超出时截断最大的数组并提示分页 |
 | `OZON_OUTPUT_DIR` | `~/.accio/outputs/ozon` | HTML 报告目录 |
 | `OZON_ACCESS_TOKEN` | — | Ozon Delivery 分组接口的 OAuth 令牌 |
+| `OZON_PERF_CLIENT_ID` / `OZON_PERF_CLIENT_SECRET` | — | 广告 Performance API 凭证，查广告数据才需要；和上面的 Seller API 凭证不是一组 |
 | `OZON_PROXY` | 空 | 只给 Ozon 请求用的代理，留空就直连。支持 `vless://` 节点链接（WebSocket 类型）、`http://`、`socks5://`；设置后优先于 `HTTPS_PROXY` |
 | `HTTPS_PROXY` | — | 标准代理变量，`OZON_PROXY` 为空时生效 |
 
@@ -105,6 +108,36 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 
 独立接口工具名为 `ozon_<官方 operationId>`，参数就是官方请求体。
 
+## 广告数据（Performance API）
+
+广告数据不在 Seller API 里，而在独立的 Performance API（`api-performance.ozon.ru`），需要另一组凭证：
+
+1. 卖家后台 **设置 → API 密钥 → Performance API**，没有服务账号就先创建
+2. 点服务账号名称 → **添加新密钥**，得到 Client ID（以 `@advertising.performance.ozon.ru` 结尾）和 Client Secret
+3. 填到 MCP 的 `env`：
+
+```json
+"env": {
+  "OZON_PERF_CLIENT_ID": "xxxx@advertising.performance.ozon.ru",
+  "OZON_PERF_CLIENT_SECRET": "你的 Client Secret"
+}
+```
+
+配置了这两项后才会出现下面 3 个广告工具（没配时工具列表与以前一样，`ozon_status` 的 `ads.setup_hint` 会提示怎么配）。只用广告功能时可以不填 `OZON_CLIENT_ID` / `OZON_API_KEY`。访问令牌由服务自动获取（30 分钟有效，提前 1 分钟换新，遇到 401 自动刷新一次），不会出现在结果里。代理设置（`OZON_PROXY` 等）与 Seller API 共用。
+
+| 工具 | 内容 |
+|---|---|
+| `ozon_ads_stats` | 【一次调用】按点击付费活动：各活动和各商品的展示、点击、点击率、加购率、下单率、花费、平均点击价、单均成本、DRR；标出点击率偏低、点击≥100 无订单、DRR 超过目标的商品。默认最近 7 天（莫斯科时间），最长 62 天。实测一个 8 个活动的店铺约 25 秒 |
+| `ozon_ads_api_catalog` | 搜索全部 48 个广告接口 + 官方说明中给出的 12 个 `/json` 报表版本，或查看单个接口的参数与响应定义 |
+| `ozon_ads_api_call` | 按路径调用任一广告接口：路径参数和查询参数放 `params`，请求体放 `body` |
+
+- `ozon_ads_stats` 的活动汇总来自 `/api/client/statistics/campaign/product/json`（同步，不消耗限额）；商品明细来自异步活动报表 `/api/client/statistics/json`（每次最多 10 个活动，同一账号同时只生成 1 个，最多等 90 秒），包含本期内已移出活动的商品。`include_products=false` 只看活动汇总
+- `/api/client/statistics/products/sku` 实测只接受今天或昨天（Ozon 返回 `date range must contain only today or yesterday`），所以不用于多天统计
+- `OZON_READ_ONLY=true` 时，改出价、启停活动、增删商品、开关“按订单付款”等 16 个写接口在发送前拦截（包括 `GET /api/client/campaign/all_sku_promo/activate` 这类用 GET 做写操作的接口）
+- 官方限制：每天总计 100 000 次；统计报表同一账号同时只能生成 1 个、一次最多 10 个活动、最长 62 天
+- 多活动统计报表是 ZIP，本服务不解压；请每次一个活动，或用 `/json` 版本
+- 活动列表按页读取（每页 100，直到读完），同时最多 4 个请求
+
 ## 限流
 
 官方文档中写明限额的接口如下。工具说明里会标出 `⚠ 限流`，调用结果附带 `rate_limit` 字段，Accio 技能要求模型把限额告诉用户。
@@ -149,7 +182,7 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 
 ```bash
 npm install
-npm test          # 26 个单元/契约测试，不联网
+npm test          # 52 个单元/契约测试，不联网
 npm run smoke     # 启动真实进程，跑一遍 MCP stdio 握手
 ```
 
@@ -159,6 +192,7 @@ npm run smoke     # 启动真实进程，跑一遍 MCP stdio 握手
 
 - 俄文主规范：https://docs.ozon.ru/api/seller/swagger.json
 - 中文辅助规范：https://docs.ozon.ru/api/seller/zh/swagger.json
+- 广告 Performance API（2026-11-09 快照）：https://docs.ozon.ru/api/performance/swagger.json 、中文 https://docs.ozon.ru/api/performance/zh/swagger.json
 - MCP SDK：`@modelcontextprotocol/server` 2.4.0
 
 `spec/` 是版本快照，不在运行时联网更新。Accio 展示技能见 `ozon-seller-assistant.skill`（源文件在 `skills/`）。

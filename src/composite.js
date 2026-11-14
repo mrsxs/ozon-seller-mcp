@@ -47,7 +47,12 @@ class Run {
   }
 }
 
-const ANALYTICS_NOTE = '销量/营收来自 /v1/analytics/data（官方限 1 次/分钟、50 次/天；相同查询 5 分钟内复用缓存）。revenue 为下单金额口径，接口不返回币种。';
+// /v1/analytics/data reports revenue in rubles whatever currency the shop sells in; product prices
+// (/v3/product/info/list) are in the shop's own currency, which may be CNY.
+const REVENUE_CURRENCY = 'RUB';
+const ANALYTICS_NOTE = '销量/营收来自 /v1/analytics/data（官方限 1 次/分钟、50 次/天；相同查询 5 分钟内复用缓存）。'
+  + 'revenue 为下单金额口径，单位卢布（revenue_currency=RUB，接口本身不返回币种）；'
+  + '商品价格 price/old_price/min_price 的币种见 price_currency（店铺结算币种，可能是 CNY），与 revenue 不同币种，不要直接相加或相除。';
 const ANALYTICS_PAGE = 1000;
 
 // ---- shared product helpers ------------------------------------------------
@@ -76,6 +81,9 @@ function productBasics(item) {
     price: num(item.price),
     old_price: num(item.old_price),
     min_price: num(item.min_price),
+    // Currency of price/old_price/min_price. `currency` is the same value under its old name, kept for
+    // existing readers; price_currency says what it applies to, next to revenue in RUB.
+    price_currency: item.currency_code,
     currency: item.currency_code,
     stocks: stockBySource(item),
     image: item.primary_image?.[0] ?? item.images?.[0],
@@ -197,6 +205,7 @@ async function topProducts(args) {
       sku,
       ordered_units: row.metrics?.[0],
       revenue: row.metrics?.[1] === undefined ? undefined : round2(row.metrics[1]),
+      revenue_currency: row.metrics?.[1] === undefined ? undefined : REVENUE_CURRENCY,
       ...basics,
       name: basics.name ?? row.dimensions?.[0]?.name,
       ...dimensions(attr),
@@ -205,9 +214,11 @@ async function topProducts(args) {
   });
   if (!rows.length) run.notes.push('该时间段没有销量数据。');
   run.notes.push(ANALYTICS_NOTE);
+  const totals = analytics?.result?.totals;
   return run.finish({
-    period, sort_by: metric, count: items.length,
-    period_totals_all_skus: analytics?.result?.totals ? { ordered_units: analytics.result.totals[0], revenue: round2(analytics.result.totals[1] ?? 0) } : undefined,
+    period, sort_by: metric, count: items.length, revenue_currency: REVENUE_CURRENCY,
+    period_totals_all_skus: totals
+      ? { ordered_units: totals[0], revenue: round2(totals[1] ?? 0), revenue_currency: REVENUE_CURRENCY } : undefined,
     items,
   });
 }
@@ -492,9 +503,10 @@ async function salesOverview(args) {
     if (services.length > 12) run.notes.push(`财务服务费共 ${services.length} 项，只列出金额最大的 12 项。`);
   }
   run.notes.push(ANALYTICS_NOTE);
+  // One label for the whole series instead of one per row: every revenue in it is RUB.
   return run.finish({
-    period, group_by: groupBy,
-    totals: totals ? { ordered_units: totals[0], revenue: round2(totals[1] ?? 0) } : undefined,
+    period, group_by: groupBy, revenue_currency: REVENUE_CURRENCY,
+    totals: totals ? { ordered_units: totals[0], revenue: round2(totals[1] ?? 0), revenue_currency: REVENUE_CURRENCY } : undefined,
     series, finance,
   });
 }
@@ -506,6 +518,7 @@ export const COMPOSITE_TOOLS = [
   {
     name: 'ozon_top_products',
     description: '【一次调用】销量/营收 Top N 商品：排行 + 商品详情（价格、库存、状态）+ 中文属性。回答“销量最高的 N 个商品/爆款/卖得最好”时优先用它，不要逐个调用底层接口。'
+      + 'revenue 单位卢布（revenue_currency），商品价格币种见 price_currency（可能是 CNY），两者不要混算。'
       + '⚠ 限流：内部调用 /v1/analytics/data（官方 1 次/分钟、50 次/天），调用前告知用户；相同参数 5 分钟内返回缓存。',
     inputSchema: obj({
       ...periodProps,
@@ -568,6 +581,7 @@ export const COMPOSITE_TOOLS = [
   {
     name: 'ozon_sales_overview',
     description: '【一次调用】经营概览：按天/周/月的销量与营收趋势 + 合计，并附同期财务余额（期初/期末、销售、退货、各项服务费）。查“最近卖了多少/营收趋势/经营情况”时用它。'
+      + '趋势与合计的 revenue 单位卢布（revenue_currency=RUB）。'
       + '⚠ 限流：内部调用 /v1/analytics/data（官方 1 次/分钟、50 次/天），与 ozon_top_products 共用额度，调用前告知用户。',
     inputSchema: obj({
       ...periodProps,

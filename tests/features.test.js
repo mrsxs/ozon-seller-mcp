@@ -3,7 +3,7 @@ import test from 'node:test';
 import { dropEmpty, fitToBudget } from '../src/compact.js';
 import { RateLimitError } from '../src/errors.js';
 import { multipart, request, setFetchForTests } from '../src/http.js';
-import { afterSuccess, beforeRequest } from '../src/ratelimit.js';
+import { admitSend, afterSuccess, beforeRequest } from '../src/ratelimit.js';
 import { callTool, listTools } from '../src/tools.js';
 import { json, mockOzon, parse, withEnv } from './helpers.js';
 
@@ -24,9 +24,12 @@ test('fitToBudget cuts the largest array and reports it', () => {
   assert.equal(value.items.length, 200, 'input must not be mutated');
 });
 
+// beforeRequest serves the cache and checks; admitSend counts the actual send, right before it goes out.
 test('rate limiter: blocks inside the window, caches identical reads, enforces the daily cap', async () => {
   await withEnv({}, () => {
     assert.equal(beforeRequest(ANALYTICS, { a: 1 }, 0), null);
+    assert.equal(beforeRequest(ANALYTICS, { a: 3 }, 0), null, 'a check alone counts nothing');
+    admitSend(ANALYTICS, 0);
     afterSuccess(ANALYTICS, { a: 1 }, { data: 'first' }, 0);
     assert.equal(beforeRequest(ANALYTICS, { a: 1 }, 1000).from_cache, true);
     assert.throws(() => beforeRequest(ANALYTICS, { a: 2 }, 1000), (e) => e instanceof RateLimitError && /1 次\/分钟/.test(e.message));
@@ -34,6 +37,7 @@ test('rate limiter: blocks inside the window, caches identical reads, enforces t
     for (let i = 1; i < 50; i += 1) {
       now += 61_000;
       assert.equal(beforeRequest(ANALYTICS, { i }, now), null);
+      admitSend(ANALYTICS, now);
     }
     assert.throws(() => beforeRequest(ANALYTICS, { i: 'over' }, now + 61_000), /小时/);
   });
@@ -265,5 +269,331 @@ test('reported proxy follows undici precedence and never hides the real cause', 
       throw new TypeError('fetch failed', { cause: Object.assign(new AggregateError(errors, ''), { code: 'ETIMEDOUT' }) });
     });
     await assert.rejects(request('/v1/seller/info', {}), /ETIMEDOUT.*185\.73\.194\.107:443; connect ETIMEDOUT 185\.73\.193\.82/s);
+  });
+});
+
+// ---- review fixes (2026-11-14) -----------------------------------------------------------------
+
+test('Retry-After is read as delay-seconds or as an HTTP-date; jitter stays bounded', async () => {
+  const { parseRetryAfter, withJitter } = await import('../src/ratelimit.js');
+  const now = Date.parse('2026-11-14T10:00:00Z');
+  assert.equal(parseRetryAfter('3', now), 3000);
+  assert.equal(parseRetryAfter(' 1.5 ', now), 1500);
+  assert.equal(parseRetryAfter('Sat, 14 Nov 2026 10:00:30 GMT', now), 30_000, 'an HTTP-date is not "2 seconds"');
+  assert.equal(parseRetryAfter('Sat, 14 Nov 2026 09:59:00 GMT', now), 0, 'a date in the past means now');
+  for (const bad of [null, undefined, '', 'soon', '-1', '1 2', '2026-11-14']) assert.equal(parseRetryAfter(bad, now), null, String(bad));
+  assert.equal(withJitter(1000, () => 0), 1000);
+  assert.equal(withJitter(1000, () => 1), 1450);
+  assert.equal(withJitter(60_000, () => 1), 61_000, 'jitter is capped at 1 s');
+});
+
+const ANALYTICS_BODY = { date_from: '2026-10-01', date_to: '2026-10-02', metrics: ['revenue'], dimension: ['day'], limit: 1 };
+
+test('a retry goes through the local limiter: a 429 on a 1/min endpoint is not resent', async () => {
+  await withEnv({}, async () => {
+    const calls = mockOzon({ '/v1/analytics/data': () => json({ message: 'slow down' }, 429, { 'retry-after': '0' }) });
+    await assert.rejects(request('/v1/analytics/data', ANALYTICS_BODY), /官方限制：1 次\/分钟，50 次\/天/);
+    assert.equal(calls.length, 1, 'the retry would be a second call inside the minute');
+  });
+});
+
+test('a 429 cools the account down for every caller; HTTP-date Retry-After is honoured', async () => {
+  await withEnv({}, async () => {
+    const retryAt = new Date(Date.now() + 31_000).toUTCString();
+    const calls = mockOzon({
+      '/v3/product/list': () => json({ message: 'too many' }, 429, { 'retry-after': retryAt }),
+      '/v1/seller/info': () => ({ company: {} }),
+    });
+    await assert.rejects(request('/v3/product/list', { limit: 1 }), (error) => {
+      assert.match(error.message, /Retry-After=(30|31) 秒/);
+      return true;
+    });
+    // Another endpoint of the same account waits for the cooldown instead of probing Ozon again.
+    await assert.rejects(request('/v1/seller/info', {}), /限流保护：Ozon 刚对该账号返回 429.*约 (30|31) 秒/);
+    assert.deepEqual(calls.map((c) => c.path), ['/v3/product/list']);
+  });
+});
+
+test('a 429 on an endpoint with its own quota cools down that endpoint only', async () => {
+  await withEnv({}, async () => {
+    const calls = mockOzon({
+      '/v1/analytics/data': () => json({}, 429, { 'retry-after': '40' }),
+      '/v3/product/list': () => ({ result: { items: [] } }),
+    });
+    await assert.rejects(request('/v1/analytics/data', ANALYTICS_BODY), /HTTP 429/);
+    assert.equal((await request('/v3/product/list', { limit: 1 })).http_status, 200);
+    assert.deepEqual(calls.map((c) => c.path), ['/v1/analytics/data', '/v3/product/list']);
+  });
+});
+
+test('the cooldown is per seller account: another shop is not held back', async () => {
+  const shops = JSON.stringify([{ name: 'a', client_id: '1', api_key: 'ka' }, { name: 'b', client_id: '2', api_key: 'kb' }]);
+  await withEnv({ OZON_SHOPS: shops }, async () => {
+    const calls = mockOzon({ '/v1/seller/info': () => (calls.at(-1).init.headers['Client-Id'] === '1' ? json({}, 429, { 'retry-after': '20' }) : { company: {} }) });
+    assert.equal((await callTool('ozon_api_call', { endpoint: '/v1/seller/info', body: {}, shop: 'a' })).isError, true);
+    assert.equal((await callTool('ozon_api_call', { endpoint: '/v1/seller/info', body: {}, shop: 'b' })).isError, undefined);
+    assert.match((await callTool('ozon_api_call', { endpoint: '/v1/seller/info', body: {}, shop: 'a' })).content[0].text, /限流保护/);
+    assert.deepEqual(calls.map((c) => c.init.headers['Client-Id']), ['1', '2']);
+  });
+});
+
+test('concurrent 429s do not double the traffic: retries draw from a per-account budget', async () => {
+  await withEnv({}, async () => {
+    const calls = mockOzon({ '/v3/product/list': () => json({}, 429, { 'retry-after': '0' }) });
+    const results = await Promise.allSettled(Array.from({ length: 10 }, (_, i) => request('/v3/product/list', { limit: i + 1 })));
+    assert.ok(results.every((r) => r.status === 'rejected'));
+    assert.equal(calls.length, 14, '10 sends + 4 budgeted retries, not 20');
+  });
+});
+
+// A response whose body breaks off after the first chunk.
+function brokenBody(contentType = 'application/json', status = 200) {
+  let sent = false;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (sent) {
+        controller.error(new TypeError('terminated', { cause: Object.assign(new Error('socket reset while reading response'), { code: 'ECONNRESET' }) }));
+      } else {
+        sent = true;
+        controller.enqueue(new TextEncoder().encode('{"result":['));
+      }
+    },
+  });
+  return new Response(body, { status, headers: { 'content-type': contentType } });
+}
+
+test('a write whose response body fails to arrive or parse reports an unknown outcome', async () => {
+  const STOCKS = { stocks: [{ offer_id: 'a', product_id: 1, stock: 1, warehouse_id: 1 }] };
+  await withEnv({ OZON_READ_ONLY: 'false' }, async () => {
+    const calls = mockOzon({ '/v2/products/stocks': () => brokenBody(), '/v3/product/list': () => brokenBody() });
+    await assert.rejects(request('/v2/products/stocks', STOCKS), (error) => {
+      assert.match(error.message, /读取 Ozon 响应时连接中断.*socket reset while reading response/);
+      assert.match(error.message, /写入结果未知，请先查询业务状态，不要自动重试/);
+      return true;
+    });
+    // A read that breaks off says what happened, without the write warning.
+    await assert.rejects(request('/v3/product/list', { limit: 1 }), (error) => {
+      assert.match(error.message, /读取 Ozon 响应时连接中断/);
+      assert.doesNotMatch(error.message, /写入结果未知/);
+      return true;
+    });
+    assert.equal(calls.filter((c) => c.path === '/v2/products/stocks').length, 1, 'never retried');
+
+    mockOzon({ '/v2/products/stocks': () => new Response('{"result":[', { headers: { 'content-type': 'application/json' } }) });
+    await assert.rejects(request('/v2/products/stocks', STOCKS), /无法解析的 JSON.*写入结果未知/);
+  });
+});
+
+test('the Node 20 big-integer fallback leaves decimals and exponents intact', async () => {
+  const { quoteBigIntegers } = await import('../src/http.js');
+  const text = '{"a":0.123456789012345678,"b":-0.123456789012345678,"c":1.5e+20,"d":12345678901234567890e-2,'
+    + '"e":[1020005028488300123,0.5,-1020005028488300123],"f":123456789012345678.9,"g":"0.123456789012345678"}';
+  const out = JSON.parse(quoteBigIntegers(text));
+  assert.equal(out.a, 0.123456789012345678);
+  assert.equal(out.b, -0.123456789012345678);
+  assert.equal(out.c, 1.5e20);
+  assert.equal(typeof out.d, 'number', 'an exponent makes it not an integer token');
+  assert.deepEqual(out.e, ['1020005028488300123', 0.5, '-1020005028488300123']);
+  assert.equal(typeof out.f, 'number');
+  assert.equal(out.g, '0.123456789012345678');
+});
+
+test('revenue is labelled RUB everywhere; product prices carry price_currency', async () => {
+  await withEnv({}, async () => {
+    mockOzon(topProductRoutes());
+    const top = parse(await callTool('ozon_top_products', { limit: 2 }));
+    assert.equal(top.revenue_currency, 'RUB');
+    assert.equal(top.period_totals_all_skus.revenue_currency, 'RUB');
+    for (const item of top.items) {
+      assert.equal(item.revenue_currency, 'RUB');
+      assert.equal(item.price_currency, 'CNY');
+      assert.equal(item.currency, 'CNY', 'the old field stays for existing readers');
+    }
+    assert.ok(top.notes.some((n) => /卢布/.test(n) && /price_currency/.test(n)), JSON.stringify(top.notes));
+    const tools = new Map(listTools().map((t) => [t.name, t]));
+    assert.match(tools.get('ozon_top_products').description, /revenue 单位卢布/);
+    assert.match(tools.get('ozon_sales_overview').description, /revenue 单位卢布/);
+  });
+  await withEnv({}, async () => {
+    const calls = mockOzon({
+      '/v1/analytics/data': () => ({ result: { data: [{ dimensions: [{ id: '2026-10-01' }], metrics: [3, 450.5] }], totals: [3, 450.5] } }),
+      // Typed date-time in the spec but documented (and accepted) as YYYY-MM-DD.
+      '/v1/finance/balance': () => ({ total: { opening_balance: { value: 1, currency_code: 'CNY' } } }),
+    });
+    const sales = parse(await callTool('ozon_sales_overview', { date_from: '2026-10-01', date_to: '2026-10-01' }));
+    assert.equal(sales.revenue_currency, 'RUB');
+    assert.equal(sales.totals.revenue_currency, 'RUB');
+    assert.equal(sales.series[0].revenue, 450.5);
+    assert.ok(sales.finance, JSON.stringify(sales.notes));
+    assert.deepEqual(calls.find((c) => c.path === '/v1/finance/balance').body, { date_from: '2026-10-01', date_to: '2026-10-01' });
+  });
+});
+
+test('error output and crash logs hide configured keys and runtime ad tokens', async () => {
+  const { rememberToken, redactText } = await import('../src/privacy.js');
+  await withEnv({ OZON_API_KEY: 'cfg-secret-123' }, () => {
+    rememberToken('runtime-token-abc', Date.now() + 60_000);
+    const error = new Error('boom: Api-Key cfg-secret-123, Authorization: Bearer runtime-token-abc');
+    const line = redactText(error);
+    assert.match(line, /\[已隐藏密钥\].*\[已隐藏令牌\]/);
+    assert.match(line, /\n\s+at /, 'the stack is kept');
+    assert.ok(!line.includes('cfg-secret-123') && !line.includes('runtime-token-abc'));
+    assert.equal(redactText({ toString() { throw new Error('x'); } }), '（无法转换为文本的错误）');
+  });
+});
+
+test('the entry point redacts uncaught errors and rejections it logs to stderr', async () => {
+  const { spawn } = await import('node:child_process');
+  const path = await import('node:path');
+  const { fileURLToPath, pathToFileURL } = await import('node:url');
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const token = 'leaky-bearer-token-0123456789';
+  const child = spawn(process.execPath, ['--import', pathToFileURL(path.join(root, 'tests', 'fixtures', 'crash-with-token.mjs')).href,
+    path.join(root, 'bin', 'ozon-seller-mcp.js')], {
+    env: { ...process.env, OZON_SHOPS: '', OZON_CLIENT_ID: '', OZON_API_KEY: 'cfg-secret-456', OZON_PERF_CLIENT_ID: '', OZON_PERF_CLIENT_SECRET: '',
+      TEST_LEAK_TOKEN: token },
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no crash log within 10 s: ${stderr}`)), 10_000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (stderr.includes('uncaughtException') && stderr.includes('unhandledRejection')) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('exit', (code) => reject(new Error(`server exited (${code}): ${stderr}`)));
+    });
+  } finally {
+    child.kill();
+  }
+  assert.ok(!stderr.includes(token), stderr);
+  assert.ok(!stderr.includes('cfg-secret-456'), stderr);
+  assert.match(stderr, /uncaughtException: Error: boom Authorization: Bearer \[已隐藏令牌\] Api-Key \[已隐藏密钥\]/);
+  assert.match(stderr, /unhandledRejection: Error: rejected \[已隐藏令牌\]/);
+});
+
+// ---- second review round (2026-11-14) ----------------------------------------------------------
+
+test('runtime tokens still valid or in use are never dropped; only expired history is capped', async () => {
+  const { rememberToken, holdToken, redact } = await import('../src/privacy.js');
+  await withEnv({}, () => {
+    const name = (kind, i) => `${kind}-${String(i).padStart(3, '0')}-tok`;
+    rememberToken('valid-first-tok', Date.now() + 60_000);
+    rememberToken('expired-in-flight-tok', Date.now() - 1);
+    const release = holdToken('expired-in-flight-tok');
+    for (let i = 0; i < 200; i += 1) rememberToken(name('valid', i), Date.now() + 60_000);
+    for (let i = 0; i < 200; i += 1) rememberToken(name('history', i), Date.now() - 1);
+    assert.equal(redact('valid-first-tok expired-in-flight-tok'), '[已隐藏令牌] [已隐藏令牌]');
+    assert.equal(redact(name('valid', 0)), '[已隐藏令牌]', 'more than 64 valid tokens are all kept');
+    assert.equal(redact(name('history', 199)), '[已隐藏令牌]', 'recent history is kept');
+    assert.equal(redact(name('history', 0)), name('history', 0), 'only old expired history is dropped');
+    release();
+    for (let i = 0; i < 100; i += 1) rememberToken(name('later', i), Date.now() - 1);
+    assert.equal(redact('expired-in-flight-tok'), 'expired-in-flight-tok', 'once released it is ordinary history');
+  });
+});
+
+const PLACEMENT = '/v1/product/placement-zone/info'; // official 10 requests/second
+
+test('the limiter counts each send right before it goes out, after any cooldown wait', async () => {
+  const { noteRateLimited } = await import('../src/ratelimit.js');
+  await withEnv({}, async () => {
+    const sentAt = [];
+    mockOzon({ [PLACEMENT]: () => {
+      sentAt.push(Date.now());
+      return { items: [] };
+    } });
+    // The account (Client-Id 1) cools down for 1.2 s; a second batch arrives once the first one's
+    // checks are more than a second old. Counted before the wait, both batches went out together.
+    noteRateLimited({ path: '/v1/seller/info' }, '1', 1200);
+    const call = (i) => request(PLACEMENT, { skus: [String(1000 + i)] });
+    const first = Array.from({ length: 10 }, (_, i) => call(i));
+    await new Promise((resolve) => setTimeout(resolve, 1050));
+    const second = Array.from({ length: 10 }, (_, i) => call(100 + i));
+    const results = await Promise.allSettled([...first, ...second]);
+    assert.equal(sentAt.length, 10, 'at most 10 sends within one second');
+    const refused = results.filter((r) => r.status === 'rejected');
+    assert.equal(refused.length, 10);
+    for (const r of refused) assert.match(r.reason.message, /限流保护：\/v1\/product\/placement-zone\/info 官方限制 10 次\/秒/);
+  });
+});
+
+test('a retry is counted when it is sent: a window filled during its delay refuses it', async () => {
+  await withEnv({}, async () => {
+    let calls = 0;
+    mockOzon({ [PLACEMENT]: (body) => {
+      calls += 1;
+      return body.skus[0] === '1' && calls === 1 ? json({}, 503, { 'retry-after': '1.1' }) : { items: [] };
+    } });
+    const retried = request(PLACEMENT, { skus: ['1'] });
+    // While the retry waits, the first send drops out of the window and ten others fill it.
+    await new Promise((resolve) => setTimeout(resolve, 1020));
+    const others = await Promise.allSettled(Array.from({ length: 10 }, (_, i) => request(PLACEMENT, { skus: [String(100 + i)] })));
+    assert.ok(others.every((r) => r.status === 'fulfilled'));
+    await assert.rejects(retried, /HTTP 503 \/v1\/product\/placement-zone\/info，未重试：限流保护.*10 次\/秒/);
+    assert.equal(calls, 11, 'the first attempt and ten others; the retry did not go out');
+  });
+});
+
+test('a write whose error response breaks off says the outcome is unknown', async () => {
+  const STOCKS = { stocks: [{ offer_id: 'a', product_id: 1, stock: 1, warehouse_id: 1 }] };
+  await withEnv({ OZON_READ_ONLY: 'false' }, async () => {
+    mockOzon({ '/v2/products/stocks': () => brokenBody('application/json', 502), '/v3/product/list': () => brokenBody('application/json', 400) });
+    await assert.rejects(request('/v2/products/stocks', STOCKS), (error) => {
+      assert.match(error.message, /^HTTP 502 \/v2\/products\/stocks：.*读取 Ozon 响应时连接中断.*socket reset/);
+      assert.match(error.message, /写入结果未知，请先查询业务状态，不要自动重试/);
+      return true;
+    });
+    await assert.rejects(request('/v3/product/list', { limit: 1 }), (error) => {
+      assert.match(error.message, /^HTTP 400 .*读取 Ozon 响应时连接中断/);
+      assert.doesNotMatch(error.message, /写入结果未知/);
+      return true;
+    });
+  });
+});
+
+test('a body cancel that never settles does not hold a Seller retry or redirect', async () => {
+  const stuck = (status, headers = {}) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{}'));
+    },
+    cancel() {
+      return new Promise(() => {});
+    },
+  }), { status, headers: { 'content-type': 'application/json', ...headers } });
+  const within = (promise, ms) => Promise.race([promise, new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`still pending after ${ms} ms`)), ms).unref();
+  })]);
+  await withEnv({}, async () => {
+    mockOzon({
+      '/v3/product/list': (_, n) => (n === 1 ? stuck(503, { 'retry-after': '0' }) : { result: { items: [] } }),
+      '/v1/seller/info': () => stuck(302, { location: 'https://example.com/' }),
+    });
+    assert.equal((await within(request('/v3/product/list', { limit: 1 }), 2000)).http_status, 200);
+    await within(assert.rejects(request('/v1/seller/info', {}), /重定向/), 2000);
+  });
+});
+
+test('a response over the size cap is cut off even when its stream cancel never settles', async () => {
+  const chunk = new Uint8Array(1_000_000).fill(32);
+  const oversized = () => new Response(new ReadableStream({
+    pull(controller) {
+      controller.enqueue(chunk); // never ends: 21 MB pass the 20 MB cap
+    },
+    cancel() {
+      return new Promise(() => {});
+    },
+  }), { headers: { 'content-type': 'application/json' } });
+  const within = (promise, ms) => Promise.race([promise, new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`still pending after ${ms} ms`)), ms).unref();
+  })]);
+  await withEnv({}, async () => {
+    mockOzon({ '/v3/product/list': oversized });
+    await within(assert.rejects(request('/v3/product/list', { limit: 1 }), /响应过大/), 5000);
   });
 });

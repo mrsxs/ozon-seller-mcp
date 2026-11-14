@@ -1,8 +1,9 @@
 // MCP tools for the Ozon Performance API (advertising cabinet).
 import { readOnlyMode } from '../config.js';
-import { adsConfigured, adsRequest } from './http.js';
+import { adsConfigured, prepareAdsRequest, timeLimit } from './http.js';
+import { observeReportStatus, reportTiming, submitReport } from './reports.js';
 import { describeAds } from './schema.js';
-import { ADS_OPERATIONS, ADS_SOURCE, findAdsOperation } from './spec.js';
+import { ADS_OPERATIONS, ADS_SOURCE, findAdsOperation, isReportStatus, isReportSubmit, reportStatus } from './spec.js';
 import { DEFAULT_THRESHOLDS, adsStats } from './stats.js';
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
@@ -45,7 +46,21 @@ function catalog(args) {
 async function call(args) {
   const op = resolveOperation(args.endpoint, args.method);
   if (!op) throw new Error('未登记的广告接口路径或 HTTP 方法；先用 ozon_ads_api_catalog 搜索。');
-  return adsRequest(op.path, { method: op.method, params: args.params ?? {}, body: args.body });
+  // Validated before it waits for anything.
+  const send = prepareAdsRequest(op.path, { method: op.method, params: args.params ?? {}, body: args.body });
+  if (isReportSubmit(op)) {
+    // Through the account's report slot: the previous report of this process is finished first,
+    // all within this call's time budget.
+    const limit = timeLimit(reportTiming.waitMs);
+    try {
+      return await submitReport(reportStatus(op), send, limit);
+    } finally {
+      limit.done();
+    }
+  }
+  const result = await send();
+  if (isReportStatus(op)) observeReportStatus(args.params?.UUID, result.data?.state);
+  return result;
 }
 
 const thresholdProps = {
@@ -90,7 +105,8 @@ const ADS_TOOLS = [
   {
     name: 'ozon_ads_api_call',
     description: '按官方路径调用 Performance API（广告）接口：路径参数和查询参数放 params（如 {"campaignId":"123"}），请求体放 body；严格按官方规范校验，'
-      + 'OZON_READ_ONLY=true 时拦截改出价、启停活动等写操作。统计报表限制：同一账号同时只能生成 1 个、一次最多 10 个活动、最长 62 天。',
+      + 'OZON_READ_ONLY=true 时拦截改出价、启停活动等写操作。统计报表限制：同一账号同时只能生成 1 个、一次最多 10 个活动、最长 62 天；'
+      + '本服务内同一账号的报表逐个生成：提交新报表前会先查上一个报表（含 ozon_ads_stats 的）的状态，等它完成（最多 90 秒；提交超过 120 秒的不再等）。',
     inputSchema: obj({
       endpoint: { type: 'string', description: '官方路径，可带 {campaignId} 这类占位符，如 /api/client/campaign/{campaignId}/v2/products' },
       method: { type: 'string', enum: HTTP_METHODS, description: '该路径只有一个方法时可省略' },

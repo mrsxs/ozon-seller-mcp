@@ -1,4 +1,5 @@
 import { resetAdsToken } from '../src/ads/http.js';
+import { resetReportSlots } from '../src/ads/reports.js';
 import { setFetchForTests } from '../src/http.js';
 import { resetRateLimits } from '../src/ratelimit.js';
 
@@ -16,9 +17,14 @@ export async function withEnv(vars, fn) {
   for (const [k, v] of Object.entries(vars)) if (v === undefined) delete process.env[k];
   resetRateLimits();
   resetAdsToken();
+  resetReportSlots();
+  // Waits and time limits never keep the process alive on their own (the stdio server does that).
+  // Node 20's test runner ends a test whose only pending work is such a timer, so hold the loop here.
+  const keepAlive = setInterval(() => {}, 60_000);
   try {
     return await fn();
   } finally {
+    clearInterval(keepAlive);
     for (const k of ENV_KEYS) {
       if (saved[k] === undefined) delete process.env[k];
       else process.env[k] = saved[k];
@@ -26,6 +32,7 @@ export async function withEnv(vars, fn) {
     setFetchForTests(null);
     resetRateLimits();
     resetAdsToken();
+    resetReportSlots();
   }
 }
 

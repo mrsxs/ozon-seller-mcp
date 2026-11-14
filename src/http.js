@@ -7,6 +7,7 @@ import { OzonError } from './errors.js';
 import { redact } from './privacy.js';
 import { afterSuccess, beforeRequest, rateLimitText, shareInflight } from './ratelimit.js';
 import { enforceMode, validate } from './schema.js';
+import { multiShop, shopForPath } from './shops.js';
 import { findOperation, mediaSource } from './spec.js';
 import { VlessConfigError, describeVless, isVlessLink, parseVless, vlessConnector } from './vless.js';
 
@@ -142,12 +143,16 @@ export function setFetchForTests(fn) {
 }
 export const currentFetch = () => fetchImpl;
 
-function credentials() {
-  const clientId = (process.env.OZON_CLIENT_ID ?? '').trim();
-  const apiKey = (process.env.OZON_API_KEY ?? '').trim();
-  if (!clientId || !apiKey) throw new OzonError('请在 MCP 配置 env 中填写 OZON_CLIENT_ID 和 OZON_API_KEY，然后重启 MCP 服务。');
-  if (/[\r\n]/.test(clientId + apiKey)) throw new OzonError('凭证包含无效换行，请检查 MCP 环境变量。');
-  return [clientId, apiKey];
+// The shop this call runs as; market endpoints always run as the market shop.
+function credentials(op) {
+  const shop = shopForPath(op.path);
+  if (!shop.clientId || !shop.apiKey) {
+    throw new OzonError(shop.legacy
+      ? '请在 MCP 配置 env 中填写 OZON_CLIENT_ID 和 OZON_API_KEY（或用 OZON_SHOPS 配置多个店铺），然后重启 MCP 服务。'
+      : `店铺「${shop.name}」缺少 client_id 或 api_key。`);
+  }
+  if (/[\r\n]/.test(shop.clientId + shop.apiKey)) throw new OzonError('凭证包含无效换行，请检查 MCP 环境变量。');
+  return shop;
 }
 
 const MIME = {
@@ -272,16 +277,17 @@ export async function request(endpoint, body = {}, method = 'POST') {
   if (body !== null && (typeof body !== 'object' || Array.isArray(body))) throw new OzonError('请求体必须为 JSON 对象。');
   body ??= {};
   validate(op.tool_name, body);
-  const [clientId, apiKey] = credentials();
+  const shop = credentials(op);
   // A broken proxy setting fails here, before a local rate-limit slot is taken.
   const agent = getDispatcher();
-  // Identical concurrent reads of a rate-limited endpoint share one request.
-  return shareInflight(op, body, () => beforeRequest(op, body) ?? send(op, body, clientId, apiKey, agent));
+  // Identical concurrent reads of a rate-limited endpoint share one request; limits count per account.
+  const scope = shop.clientId;
+  return shareInflight(op, body, () => beforeRequest(op, body, Date.now(), scope) ?? send(op, body, shop, agent), scope);
 }
 
-async function send(op, body, clientId, apiKey, agent) {
+async function send(op, body, shop, agent) {
   const endpoint = op.path;
-  const headers = { 'Client-Id': clientId, 'Api-Key': apiKey, Accept: 'application/json', 'User-Agent': USER_AGENT };
+  const headers = { 'Client-Id': shop.clientId, 'Api-Key': shop.apiKey, Accept: 'application/json', 'User-Agent': USER_AGENT };
   let payload;
   const [mediaType] = mediaSource(op);
   if (mediaType === 'multipart/form-data') {
@@ -293,8 +299,10 @@ async function send(op, body, clientId, apiKey, agent) {
   }
   if (op.method === 'GET') payload = undefined;
   if (op.tags.some((t) => OAUTH_TAGS.has(t))) {
-    const token = (process.env.OZON_ACCESS_TOKEN ?? '').trim();
-    if (!token) throw new OzonError('Ozon Delivery 接口需要 OAuth；请在 MCP env 中配置 OZON_ACCESS_TOKEN。');
+    const token = shop.accessToken;
+    if (!token) throw new OzonError(shop.legacy
+      ? 'Ozon Delivery 接口需要 OAuth；请在 MCP env 中配置 OZON_ACCESS_TOKEN。'
+      : `Ozon Delivery 接口需要 OAuth；请给店铺「${shop.name}」配置 access_token。`);
     if (/[\r\n]/.test(token)) throw new OzonError('OZON_ACCESS_TOKEN 包含无效换行。');
     headers.Authorization = 'Bearer ' + token;
   }
@@ -347,13 +355,14 @@ async function send(op, body, clientId, apiKey, agent) {
     }
     const result = {
       endpoint,
+      ...(multiShop() ? { shop: shop.name } : {}),
       http_status: response.status,
       queried_at_utc: new Date().toISOString(),
       elapsed_ms: Math.round(performance.now() - start),
       rate_limit_remaining: response.headers.get('ratelimit-remaining'),
       data: redact(data),
     };
-    afterSuccess(op, body, result);
+    afterSuccess(op, body, result, Date.now(), shop.clientId);
     return result;
   }
   throw new OzonError('查询未完成。');

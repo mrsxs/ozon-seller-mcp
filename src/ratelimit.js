@@ -1,5 +1,6 @@
 // Official per-endpoint limits, transcribed from the pinned spec descriptions.
-// Local counting is per MCP process; Ozon's server-side counter is authoritative.
+// Local counting is per MCP process and per seller account (`scope` = Client-Id: Ozon counts each
+// account separately); Ozon's server-side counter is authoritative.
 import { RateLimitError } from './errors.js';
 
 const MIN = 60_000;
@@ -49,20 +50,21 @@ function waitText(ms) {
   return `${Math.ceil(s / 3600)} 小时`;
 }
 
-const cacheKey = (op, body) => `${op.method} ${op.path} ${JSON.stringify(body ?? {})}`;
+const cacheKey = (op, body, scope) => `${scope}|${op.method} ${op.path} ${JSON.stringify(body ?? {})}`;
 
 // Returns a cached result for an identical read, throws if the local window is exhausted.
-export function beforeRequest(op, body, now = Date.now()) {
+export function beforeRequest(op, body, now = Date.now(), scope = '') {
   const rule = RATE_LIMITS[op.path];
   if (!rule?.windows) return null;
   if (op.read_only) {
-    const hit = cache.get(cacheKey(op, body));
+    const hit = cache.get(cacheKey(op, body, scope));
     if (hit && now - hit.at < CACHE_TTL) {
       return { ...hit.result, from_cache: true, cached_at_utc: new Date(hit.at).toISOString() };
     }
   }
-  const stamps = (history.get(op.path) ?? []).filter((t) => now - t < DAY);
-  history.set(op.path, stamps);
+  const historyKey = `${scope}|${op.path}`;
+  const stamps = (history.get(historyKey) ?? []).filter((t) => now - t < DAY);
+  history.set(historyKey, stamps);
   for (const [window, max] of rule.windows) {
     const used = stamps.filter((t) => now - t < window);
     if (used.length >= max) {
@@ -75,17 +77,17 @@ export function beforeRequest(op, body, now = Date.now()) {
   return null;
 }
 
-export function afterSuccess(op, body, result, now = Date.now()) {
+export function afterSuccess(op, body, result, now = Date.now(), scope = '') {
   if (!op.read_only || !RATE_LIMITS[op.path]?.windows) return;
   for (const [key, entry] of cache) if (now - entry.at >= CACHE_TTL) cache.delete(key);
-  cache.set(cacheKey(op, body), { at: now, result });
+  cache.set(cacheKey(op, body, scope), { at: now, result });
 }
 
 const inflight = new Map();
 
-export function shareInflight(op, body, fn) {
+export function shareInflight(op, body, fn, scope = '') {
   if (!op.read_only || !RATE_LIMITS[op.path]?.windows) return Promise.resolve().then(fn);
-  const key = cacheKey(op, body);
+  const key = cacheKey(op, body, scope);
   if (!inflight.has(key)) {
     inflight.set(key, Promise.resolve().then(fn).finally(() => inflight.delete(key)));
   }

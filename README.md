@@ -37,7 +37,8 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `OZON_CLIENT_ID` / `OZON_API_KEY` | — | 店铺凭证，必填 |
+| `OZON_CLIENT_ID` / `OZON_API_KEY` | — | 单店凭证；只有一家店时用 |
+| `OZON_SHOPS` | — | 多店铺：JSON 数组，见下方「多店铺」；填了它就不再读单店的 4 个凭证变量 |
 | `OZON_READ_ONLY` | `true` | `false` 才允许写操作；其他值启动报错，拼写错误不会开放写入 |
 | `OZON_TOOLSET` | `core` | `core` 常用工具；`minimal` 只要组合工具和通用工具；`all` 全部接口；可追加接口路径或工具名，逗号分隔，如 `core,/v1/returns/list` |
 | `OZON_COMPACT` | `true` | 结果省略 null、空字符串、空数组、空对象 |
@@ -49,6 +50,32 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 | `HTTPS_PROXY` | — | 标准代理变量，`OZON_PROXY` 为空时生效 |
 
 修改后需要重启 MCP。
+
+## 多店铺
+
+一个 MCP 连多家店：`OZON_SHOPS` 填一个 JSON 数组，每家店一项。
+
+```json
+"env": {
+  "OZON_SHOPS": "[{\"name\":\"shop-a\",\"client_id\":\"…\",\"api_key\":\"…\",\"perf_client_id\":\"…@advertising.performance.ozon.ru\",\"perf_client_secret\":\"…\",\"market\":true,\"default\":true},{\"name\":\"shop-b\",\"client_id\":\"…\",\"api_key\":\"…\",\"perf_client_id\":\"…\",\"perf_client_secret\":\"…\"}]",
+  "OZON_READ_ONLY": "true"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `name` | 是 | 店铺名，1～32 个字母、数字、汉字、`_`、`-`，不能重复；调用时用它选店 |
+| `client_id` / `api_key` | 二选一 | 该店的 Seller API 凭证，两项要么都填要么都不填 |
+| `perf_client_id` / `perf_client_secret` | 二选一 | 该店的广告凭证，两项要么都填要么都不填；每家店至少填一组凭证（只做广告的店可以不填 Seller API） |
+| `access_token` | 否 | 该店的 Ozon Delivery OAuth 令牌 |
+| `default` | 否 | `true` = 调用不指定店铺时用它；不标就用第一项 |
+| `market` | 否 | `true` = 市场数据店，最多一家；没有店标它时，市场数据接口就用调用时选的那家店 |
+
+- 访问 Ozon 的工具（含组合工具、广告工具）都多一个可选参数 `shop`（店铺名），不填用默认店。结果里的 `shop` 字段写明实际用哪家店的凭证查的。只在本地运行的工具（`ozon_status`、目录、说明、校验、报告）没有这个参数。
+- **市场数据固定走 `market` 店**：类目大盘 `/v1/analytics/category/comparison`、全站热搜词 `/v1/search-queries/top`、`/v1/search-queries/text` 要 Premium Pro 订阅，结果和查询的店铺无关，所以不论 `shop` 填哪家，都用市场数据店的凭证查。本店相关的数据（销量、商品搜索词、价格指数、广告）一律用各自店的凭证。
+- 限流和 5 分钟读缓存按店铺（Client-Id）分开计；广告令牌每家店各一个。
+- 配置有错（JSON 不合法、缺凭证、重名、未知字段、两家店填了同一个 `client_id` / `perf_client_id`、两家都标 `market`）启动时直接报错，报错只说第几项哪个字段，不回显密钥。所有店的密钥都会从结果和报错里隐藏。
+- `ozon_status` 列出每家店的名称、Client-Id、是否默认 / 市场店、是否配了 Seller API / 广告凭证，不含密钥。
 
 ## 通过节点访问 Ozon
 

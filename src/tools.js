@@ -9,6 +9,7 @@ import { hidePersonal, redact } from './privacy.js';
 import { rateLimitText } from './ratelimit.js';
 import { renderReport } from './reports.js';
 import { compileSchema, describe, enforceMode, formatErrors, inputSchema, validate } from './schema.js';
+import { MARKET_PATHS, defaultShop, findShop, hasAds, hasSeller, marketShop, multiShop, runAsShop, shops } from './shops.js';
 import { CATALOG, OPERATIONS, findOperation, operationSource } from './spec.js';
 import { VERSION } from './version.js';
 
@@ -100,12 +101,34 @@ function makeTool(op) {
 
 const strip = ({ handler, ...tool }) => tool;
 
+// A tool reaches Ozon unless its annotations say otherwise (openWorldHint: false = local only).
+const reachesOzon = (tool) => tool.annotations?.openWorldHint !== false;
+
+function shopProperty() {
+  const market = marketShop();
+  return {
+    type: 'string', enum: shops().map((s) => s.name),
+    description: `店铺；不填 = 默认店「${defaultShop().name}」。`
+      + (market ? `市场数据接口（${[...MARKET_PATHS].join('、')}）不论填哪家都用「${market.name}」的凭证查询。` : ''),
+  };
+}
+
+// With several shops configured, every tool that reaches Ozon gains an optional `shop` argument.
+function withShop(tool, property) {
+  if (!property || !reachesOzon(tool)) return tool;
+  const base = tool.inputSchema ?? { type: 'object', properties: {} };
+  return { ...tool, inputSchema: { ...base, properties: { ...(base.properties ?? {}), shop: property } } };
+}
+
 export function listTools() {
-  return [...metaTools(), ...COMPOSITE_TOOLS.map(strip), ...listAdsTools(), ...selectedOperations().map(makeTool)];
+  const property = multiShop() ? shopProperty() : null;
+  return [...metaTools(), ...COMPOSITE_TOOLS.map(strip), ...listAdsTools(), ...selectedOperations().map(makeTool)]
+    .map((tool) => withShop(tool, property));
 }
 
 // Called once at startup so configuration typos fail loudly instead of mid-conversation.
 export function checkConfiguration() {
+  shops();
   readOnlyMode();
   compactEnabled();
   maxResultBytes();
@@ -156,16 +179,26 @@ async function execute(name, args) {
   switch (name) {
     case 'ozon_status': {
       const readOnly = readOnlyMode();
+      const main = defaultShop();
       return {
         version: VERSION, read_only: readOnly, toolset: toolsetSpec(), listed_tools: listTools().length,
-        api_key_configured: Boolean(process.env.OZON_API_KEY), client_id: process.env.OZON_CLIENT_ID || null,
+        api_key_configured: hasSeller(main), client_id: main.clientId || null,
+        ...(main.legacy ? {} : {
+          default_shop: main.name, market_shop: marketShop()?.name ?? null, market_endpoints: [...MARKET_PATHS],
+          shops: shops().map((s) => ({
+            name: s.name, client_id: s.clientId || null, default: s === main, market: s.market,
+            seller_api_configured: hasSeller(s), ads_configured: hasAds(s), ads_client_id: s.perfClientId || null,
+            delivery_token_configured: Boolean(s.accessToken),
+          })),
+        }),
         official_operations: OPERATIONS.size,
         available_api_operations: [...OPERATIONS.values()].filter((o) => !readOnly || o.read_only).length,
         compact_results: compactEnabled(), max_result_kb: Math.round(maxResultBytes() / 1024),
         source_date: CATALOG.source_date, source_version: CATALOG.source_version,
         node: process.version, platform: process.platform, proxy: proxySummary(),
         ads: {
-          credentials_configured: adsConfigured(), client_id: process.env.OZON_PERF_CLIENT_ID?.trim() || null,
+          // With several shops the per-shop list above says which ones have ads credentials.
+          credentials_configured: adsConfigured(), client_id: main.legacy ? main.perfClientId || null : undefined,
           official_operations: ADS_OPERATIONS.length, source_date: ADS_SOURCE.date, source_version: ADS_SOURCE.version,
           setup_hint: adsConfigured() ? undefined : `广告工具（ozon_ads_stats 等）未启用。${CREDENTIAL_HELP}`,
         },
@@ -198,17 +231,42 @@ async function execute(name, args) {
 }
 
 function checkToolArguments(name, args) {
-  const tool = metaTools().find((t) => t.name === name) ?? COMPOSITE.get(name) ?? ADS_TOOL_MAP.get(name);
+  const tool = toolDefinition(name);
   if (!tool) return;
   const check = compileSchema('tool:' + name, tool.inputSchema);
   if (!check(args)) throw new Error(`工具参数校验失败；未执行操作。${formatErrors(check.errors, 3).join('；')}`);
 }
 
+function toolDefinition(name) {
+  return metaTools().find((t) => t.name === name) ?? COMPOSITE.get(name) ?? ADS_TOOL_MAP.get(name);
+}
+
+// Generated endpoint tools always reach Ozon; the hand-written ones say so in their annotations.
+const isLocalTool = (name) => !OPERATIONS.has(name) && toolDefinition(name)?.annotations?.openWorldHint === false;
+
+// `shop` is ours, not part of any Ozon request body: take it off before the tool's own validation.
+function pickShop(name, args) {
+  const { shop, ...input } = args ?? {};
+  if (shop === undefined) return [defaultShop(), input];
+  if (isLocalTool(name)) throw new Error(`${name} 不访问店铺数据，不需要 shop 参数。`);
+  if (typeof shop !== 'string') throw new Error('shop 必须是店铺名（字符串）。');
+  return [findShop(shop), input];
+}
+
+const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+// With several shops, every result that came from Ozon says whose credentials answered it. Endpoint
+// results set it themselves (a market endpoint answers as the market shop); the rest ran as `shop`.
+function labelShop(name, shop, result) {
+  if (!multiShop() || isLocalTool(name) || !isPlainObject(result) || 'shop' in result) return result;
+  return { shop: shop.name, ...result };
+}
+
 export async function callTool(name, args) {
   try {
-    const input = args ?? {};
+    const [shop, input] = pickShop(name, args);
     checkToolArguments(name, input);
-    const result = redact(await execute(name, input));
+    const result = redact(labelShop(name, shop, await runAsShop(shop, () => execute(name, input))));
     return { content: [{ type: 'text', text: JSON.stringify(result) }] };
   } catch (error) {
     return { content: [{ type: 'text', text: redact(String(error?.message ?? error)) }], isError: true };

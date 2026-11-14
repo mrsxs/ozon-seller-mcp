@@ -4,7 +4,7 @@ import { resetRateLimits } from '../src/ratelimit.js';
 
 const ENV_KEYS = ['OZON_READ_ONLY', 'OZON_TOOLSET', 'OZON_CLIENT_ID', 'OZON_API_KEY', 'OZON_ACCESS_TOKEN',
   'OZON_COMPACT', 'OZON_MAX_RESULT_KB', 'OZON_OUTPUT_DIR', 'https_proxy', 'HTTPS_PROXY', 'http_proxy', 'HTTP_PROXY', 'no_proxy', 'NO_PROXY', 'OZON_PROXY',
-  'OZON_PERF_CLIENT_ID', 'OZON_PERF_CLIENT_SECRET'];
+  'OZON_PERF_CLIENT_ID', 'OZON_PERF_CLIENT_SECRET', 'OZON_SHOPS'];
 
 export const PERF_ID = 'perf-id@advertising.performance.ozon.ru';
 export const PERF_SECRET = 'perf-secret-value';

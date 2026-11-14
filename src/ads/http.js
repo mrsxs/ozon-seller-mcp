@@ -4,6 +4,7 @@ import { OzonError, ValidationError } from '../errors.js';
 import { currentFetch, describeNetworkError, getDispatcher, parseJson, readCapped, sleep } from '../http.js';
 import { redact } from '../privacy.js';
 import { enforceMode } from '../schema.js';
+import { currentShop, hasAds, shops } from '../shops.js';
 import { VERSION } from '../version.js';
 import { parseCsv } from './csv.js';
 import { SAFE_PATH_VALUE, pathParamNames, validateAdsRequest } from './schema.js';
@@ -22,27 +23,33 @@ export const CREDENTIAL_HELP = '在卖家后台 设置 → API 密钥 → Perfor
   + '把 Client ID（以 @advertising.performance.ozon.ru 结尾）和 Client Secret 分别填到 MCP env 的 OZON_PERF_CLIENT_ID、OZON_PERF_CLIENT_SECRET，然后重启 MCP。'
   + '它和 OZON_CLIENT_ID / OZON_API_KEY（Seller API）不是同一组凭证。';
 
-let cachedToken = null;
-let pendingToken = null;
+// One token per Performance client: shops alternating in one process must not evict each other's token.
+const cachedTokens = new Map();
+const pendingTokens = new Map();
 
 export function resetAdsToken() {
-  cachedToken = null;
-  pendingToken = null;
+  cachedTokens.clear();
+  pendingTokens.clear();
 }
 
-export const adsConfigured = () => Boolean((process.env.OZON_PERF_CLIENT_ID ?? '').trim() && (process.env.OZON_PERF_CLIENT_SECRET ?? '').trim());
+// True when any shop has Performance API credentials (the ads tools are listed then).
+export const adsConfigured = () => shops().some(hasAds);
 
 function adsCredentials() {
-  const clientId = (process.env.OZON_PERF_CLIENT_ID ?? '').trim();
-  const secret = (process.env.OZON_PERF_CLIENT_SECRET ?? '').trim();
-  if (!clientId || !secret) throw new OzonError(`广告数据需要 Performance API 凭证，OZON_PERF_CLIENT_ID / OZON_PERF_CLIENT_SECRET 未配置。${CREDENTIAL_HELP}`);
-  if (/[\r\n]/.test(clientId + secret)) throw new OzonError('Performance API 凭证包含无效换行，请检查 MCP 环境变量。');
-  return { clientId, secret };
+  const shop = currentShop();
+  if (!hasAds(shop)) {
+    throw new OzonError(shop.legacy
+      ? `广告数据需要 Performance API 凭证，OZON_PERF_CLIENT_ID / OZON_PERF_CLIENT_SECRET 未配置。${CREDENTIAL_HELP}`
+      : `店铺「${shop.name}」没有配置广告凭证（perf_client_id / perf_client_secret）。`);
+  }
+  if (/[\r\n]/.test(shop.perfClientId + shop.perfSecret)) throw new OzonError('Performance API 凭证包含无效换行，请检查 MCP 环境变量。');
+  return { clientId: shop.perfClientId, secret: shop.perfSecret, shop };
 }
 
-// Bearer tokens are credentials too: hide the one a request used as well as the current one.
+// Bearer tokens are credentials too: hide the one a request used as well as every cached one.
 function hideTokens(text, ...tokens) {
-  return [...tokens, cachedToken?.value].filter(Boolean).reduce((out, token) => out.replaceAll(token, '[已隐藏令牌]'), String(text));
+  const cached = [...cachedTokens.values()].map((t) => t.value);
+  return [...tokens, ...cached].filter(Boolean).reduce((out, token) => out.replaceAll(token, '[已隐藏令牌]'), String(text));
 }
 
 function scrubTokens(data, token) {
@@ -70,7 +77,7 @@ async function rejectRedirect(response, path) {
 
 const errorText = async (response, token) => hideTokens(redact((await response.text().catch(() => '')).slice(0, 2000)), token);
 
-async function requestToken({ clientId, secret }, agent) {
+async function requestToken({ clientId, secret, shop }, agent) {
   const response = await send(ADS_BASE_URL + TOKEN_PATH, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': USER_AGENT },
@@ -78,8 +85,9 @@ async function requestToken({ clientId, secret }, agent) {
   }, agent);
   await rejectRedirect(response, TOKEN_PATH);
   if (!response.ok) {
+    const fields = shop.legacy ? 'OZON_PERF_CLIENT_ID 和 OZON_PERF_CLIENT_SECRET' : `店铺「${shop.name}」的 perf_client_id 和 perf_client_secret`;
     const hint = response.status < 500
-      ? `检查 OZON_PERF_CLIENT_ID 和 OZON_PERF_CLIENT_SECRET 是否完整、密钥是否已被删除。${CREDENTIAL_HELP}`
+      ? `检查 ${fields} 是否完整、密钥是否已被删除。${shop.legacy ? CREDENTIAL_HELP : ''}`
       : 'Ozon 授权服务暂时不可用，稍后再试。';
     throw new OzonError(`Performance API 授权失败（HTTP ${response.status}）：${hint} ${await errorText(response)}`);
   }
@@ -96,21 +104,21 @@ async function requestToken({ clientId, secret }, agent) {
 
 // `rejected` is the token that just got a 401: a newer cached token is reused, otherwise a new one is fetched.
 async function getToken(credentials, agent, rejected) {
-  const usable = cachedToken && cachedToken.clientId === credentials.clientId
-    && cachedToken.value !== rejected && Date.now() < cachedToken.expiresAt;
-  if (usable) return cachedToken.value;
-  if (!pendingToken || pendingToken.clientId !== credentials.clientId) {
+  const { clientId } = credentials;
+  const cached = cachedTokens.get(clientId);
+  if (cached && cached.value !== rejected && Date.now() < cached.expiresAt) return cached.value;
+  if (!pendingTokens.has(clientId)) {
     const promise = requestToken(credentials, agent)
       .then((token) => {
-        cachedToken = token;
+        cachedTokens.set(clientId, token);
         return token.value;
       })
       .finally(() => {
-        if (pendingToken?.promise === promise) pendingToken = null;
+        if (pendingTokens.get(clientId) === promise) pendingTokens.delete(clientId);
       });
-    pendingToken = { clientId: credentials.clientId, promise };
+    pendingTokens.set(clientId, promise);
   }
-  return pendingToken.promise;
+  return pendingTokens.get(clientId);
 }
 
 function buildUrl(op, params) {

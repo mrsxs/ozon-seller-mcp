@@ -6,7 +6,11 @@
 // period up to 62 days and includes products already removed from a campaign. The synchronous
 // /api/client/statistics/products/sku only accepts today or yesterday (live check 2026-11-09).
 import { sleep } from '../http.js';
-import { adsRequest } from './http.js';
+import { adsAccount, adsRequest, timeLimit, untilAborted } from './http.js';
+import { isFinished, observeReportStatus, reportTiming, submitReport } from './reports.js';
+import { REPORT_STATUS, REPORT_STATUS_PATH } from './spec.js';
+
+export { setReportTimingForTests } from './reports.js';
 
 const DAY = 86_400_000;
 const MOSCOW_OFFSET = 3 * 3_600_000;
@@ -17,12 +21,6 @@ const MAX_PAGES = 50;
 const CONCURRENCY = 4;
 const CAMPAIGN_STATS_BATCH = 50;
 const REPORT_BATCH = 10; // official: at most 10 campaigns per report
-// Report polling: every 3 s, at most 90 s in total for all batches of one tool call.
-const DEFAULT_REPORT_TIMING = Object.freeze({ pollMs: 3000, waitMs: 90_000 });
-let reportTiming = DEFAULT_REPORT_TIMING;
-export function setReportTimingForTests(timing) {
-  reportTiming = { ...DEFAULT_REPORT_TIMING, ...timing };
-}
 const FIELDS = ['views', 'clicks', 'toCart', 'orders', 'sales', 'expense', 'modelOrders', 'modelSales'];
 
 export const DEFAULT_THRESHOLDS = Object.freeze({ target_drr: 30, min_views: 1000, min_clicks: 100, low_ctr_ratio: 0.7 });
@@ -117,17 +115,22 @@ function campaignFlags(c, th) {
   return flags;
 }
 
+// One ozon_ads_stats call. Every request it makes carries the call's single time budget (`signal`).
 class Run {
   notes = [];
   timing_ms = {};
   sources = new Set();
   started = performance.now();
 
+  constructor(signal) {
+    this.signal = signal;
+  }
+
   async call(label, endpoint, options) {
     const t = performance.now();
     this.sources.add(endpoint);
     try {
-      return (await adsRequest(endpoint, options)).data;
+      return (await adsRequest(endpoint, { ...options, signal: this.signal })).data;
     } finally {
       this.timing_ms[label] = (this.timing_ms[label] ?? 0) + Math.round(performance.now() - t);
     }
@@ -180,18 +183,6 @@ async function fetchCampaignTotals(run, ids, period) {
   return new Map(pages.flatMap((page) => page?.rows ?? []).map((row) => [String(row.id), campaignTotals(row)]));
 }
 
-async function waitForReport(run, uuid, deadline) {
-  for (;;) {
-    const status = await run.call('等待商品报表', '/api/client/statistics/{UUID}', { params: { UUID: uuid } });
-    if (status?.state === 'OK') return { ready: true };
-    if (status?.state === 'ERROR') return { ready: false, reason: `生成失败：${status.error ?? 'Ozon 未说明原因'}` };
-    if (Date.now() + reportTiming.pollMs > deadline) {
-      return { ready: false, reason: `在 ${Math.round(reportTiming.waitMs / 1000)} 秒内未生成完（状态 ${status?.state ?? '未知'}）` };
-    }
-    await sleep(reportTiming.pollMs);
-  }
-}
-
 const productTotals = (row) => ({
   views: amount(row.views), clicks: amount(row.clicks), toCart: amount(row.toCart), orders: amount(row.orders),
   sales: amount(row.ordersMoney), expense: amount(row.moneySpent), modelOrders: amount(row.models), modelSales: amount(row.modelsMoney),
@@ -207,25 +198,77 @@ function reportRows(data, batch) {
   return entries.flatMap(([campaignId, entry]) => (entry.report.rows ?? []).map((row) => ({ campaignId: String(campaignId), row })));
 }
 
-async function reportBatch(run, batch, period, deadline) {
-  const submitted = await run.call('生成商品报表', '/api/client/statistics/json',
-    { method: 'POST', body: { campaigns: batch, dateFrom: period.date_from, dateTo: period.date_to, groupBy: 'NO_GROUP_BY' } });
+// Identical report batches requested at the same time (e.g. two clients asking the same question)
+// share one report: keyed by Performance account and request body.
+const sharedReports = new Map();
+const REPORT_ENDPOINTS = ['/api/client/statistics/json', REPORT_STATUS_PATH, '/api/client/statistics/report'];
+const SHARED_NOTE = '部分商品报表与同时进行的相同查询共用（同一广告账号、相同活动与日期只生成一次）。';
+const seconds = () => Math.round(reportTiming.waitMs / 1000);
+
+async function waitForReport(run, uuid, deadline) {
+  let status;
+  const unfinished = () => ({ ready: false, reason: `在 ${seconds()} 秒内未生成完（状态 ${status?.state ?? '未知'}）` });
+  try {
+    for (;;) {
+      status = await run.call('等待商品报表', REPORT_STATUS_PATH, { params: { UUID: uuid } });
+      observeReportStatus(uuid, status?.state);
+      if (status?.state === 'OK') return { ready: true };
+      if (isFinished(status?.state)) return { ready: false, reason: `生成失败：${status.error ?? 'Ozon 未说明原因'}` };
+      if (Date.now() + reportTiming.pollMs > deadline) return unfinished();
+      await sleep(reportTiming.pollMs, run.signal);
+    }
+  } catch (error) {
+    // The call's time is up, even in the middle of a status request that hangs.
+    if (run.signal.aborted) return unfinished();
+    throw error;
+  }
+}
+
+// Each batch is submitted through the account's report slot (src/ads/reports.js), shared by every
+// call in this process: the previous report, from this call or another, is finished first.
+function reportBatch(run, batch, period, deadline) {
+  const body = { campaigns: batch, dateFrom: period.date_from, dateTo: period.date_to, groupBy: 'NO_GROUP_BY' };
+  const key = `${adsAccount()}|${JSON.stringify(body)}`;
+  const shared = sharedReports.get(key);
+  if (shared) {
+    for (const endpoint of REPORT_ENDPOINTS) run.sources.add(endpoint);
+    if (!run.notes.includes(SHARED_NOTE)) run.notes.push(SHARED_NOTE);
+    // Each waiter keeps its own deadline; the shared job runs on for whoever is still waiting.
+    return untilAborted(shared, run.signal, `商品报表在 ${seconds()} 秒内未完成（与同时进行的相同查询共用的报表还没好）`);
+  }
+  const job = generateReport(run, batch, body, deadline).finally(() => sharedReports.delete(key));
+  sharedReports.set(key, job);
+  return job;
+}
+
+async function generateReport(run, batch, body, deadline) {
+  // A request cut off by the call's time budget says so.
+  const timedOut = (error) => (run.signal.aborted ? new Error(`商品报表在 ${seconds()} 秒内未完成（${error.message}）`) : error);
+  const call = (label, endpoint, options) => run.call(label, endpoint, options).catch((error) => {
+    throw timedOut(error);
+  });
+  // Errors of the submission itself are reworded only after the slot has seen them as they are
+  // (whether it went out without a definite answer decides what the next submission waits for).
+  const submitted = await submitReport(REPORT_STATUS,
+    () => run.call('生成商品报表', '/api/client/statistics/json', { method: 'POST', body }), { signal: run.signal, deadline })
+    .catch((error) => {
+      throw timedOut(error);
+    });
   const uuid = submitted?.UUID;
   if (!uuid) throw new Error('Ozon 未返回商品报表的 UUID');
-  const { ready, reason } = await waitForReport(run, uuid, deadline);
-  if (!ready) {
-    throw new Error(`商品报表${reason}；稍后可用 ozon_ads_api_call 查 /api/client/statistics/{UUID}（UUID=${uuid}），状态为 OK 后调用 /api/client/statistics/report 下载`);
+  const result = await waitForReport(run, uuid, deadline);
+  if (!result.ready) {
+    throw new Error(`商品报表${result.reason}；稍后可用 ozon_ads_api_call 查 /api/client/statistics/{UUID}（UUID=${uuid}），状态为 OK 后调用 /api/client/statistics/report 下载`);
   }
-  const rows = reportRows(await run.call('下载商品报表', '/api/client/statistics/report', { params: { UUID: uuid } }), batch);
+  const rows = reportRows(await call('下载商品报表', '/api/client/statistics/report', { params: { UUID: uuid } }), batch);
   if (!rows) throw new Error(`商品报表为空或不是预期的 JSON 格式（UUID=${uuid}）`);
   return rows;
 }
 
 // Reports run one at a time per account (official limit), so batches go strictly in sequence.
 // A failure keeps what was fetched and names every campaign left without product rows.
-async function fetchProductRows(run, ids, period) {
+async function fetchProductRows(run, ids, period, deadline) {
   const rows = [];
-  const deadline = Date.now() + reportTiming.waitMs;
   const batches = chunks(ids, REPORT_BATCH);
   for (const [index, batch] of batches.entries()) {
     try {
@@ -286,9 +329,24 @@ function productRow(p, campaign, th) {
   return { ...row, flags: productFlags(row, campaign?.ctr_pct, th) };
 }
 
+// One time budget for the whole call, created here: campaign list and pages, totals, token, cooldown
+// waits, retries, the previous report, submission, polling and download. Its timer never keeps the
+// process alive and is cleared when the call settles.
 export async function adsStats(args) {
-  const run = new Run();
   const period = resolvePeriod(args);
+  const limit = timeLimit(reportTiming.waitMs);
+  try {
+    return await analyse(args, period, new Run(limit.signal), limit.deadline);
+  } catch (error) {
+    if (!limit.signal.aborted) throw error;
+    throw new Error(`广告统计在 ${seconds()} 秒内未完成，已取消剩余请求（${error.message}）。可缩短日期范围、用 campaign_ids 缩小范围，`
+      + '或 include_products=false 只看活动汇总。');
+  } finally {
+    limit.done();
+  }
+}
+
+async function analyse(args, period, run, deadline) {
   const th = Object.fromEntries(Object.entries(DEFAULT_THRESHOLDS).map(([key, fallback]) => [key, args[key] ?? fallback]));
   const { complete: campaignsComplete, campaigns } = await listCampaigns(run, args);
   if (!campaigns.length) {
@@ -301,15 +359,18 @@ export async function adsStats(args) {
 
   // Campaigns without views or spend have no product rows; skipping them saves report quota.
   const active = campaignRows.filter((c) => c.views > 0 || c.expense > 0).map((c) => c.id);
-  const report = args.include_products === false || !active.length ? { rows: [], complete: true } : await fetchProductRows(run, active, period);
+  const report = args.include_products === false || !active.length ? { rows: [], complete: true }
+    : await fetchProductRows(run, active, period, deadline);
   const productRows = report.rows;
   const campaignById = new Map(campaignRows.map((c) => [c.id, c]));
   const products = aggregateProducts(productRows)
     .map((p) => productRow(p, campaignById.get(p.campaignId), th))
     .sort((a, b) => b.expense - a.expense);
 
-  const limit = args.product_limit ?? 50;
-  if (products.length > limit) run.notes.push(`商品共 ${products.length} 行，按花费只列前 ${limit} 行；可调大 product_limit 或用 campaign_ids 缩小范围。`);
+  const productLimit = args.product_limit ?? 50;
+  if (products.length > productLimit) {
+    run.notes.push(`商品共 ${products.length} 行，按花费只列前 ${productLimit} 行；可调大 product_limit 或用 campaign_ids 缩小范围。`);
+  }
   if (productRows.length) {
     run.notes.push('商品明细来自异步报表（官方：同一账号同时只能生成 1 个、每天有次数上限），包含本期内已移出活动的商品（removed_from_campaign）。');
   }
@@ -325,6 +386,6 @@ export async function adsStats(args) {
     campaigns: campaignRows,
     products_complete: report.complete,
     products_total: products.length,
-    products: products.slice(0, limit),
+    products: products.slice(0, productLimit),
   });
 }

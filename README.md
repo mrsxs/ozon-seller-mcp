@@ -122,6 +122,8 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 
 \* 2026-10-26 在一家约 480 个商品的店铺实测，从国内网络访问。
 
+营收 `revenue`（来自 `/v1/analytics/data`）单位是卢布，结果里带 `revenue_currency: "RUB"`；商品价格 `price`/`old_price`/`min_price` 是店铺结算币种（可能是 CNY），见 `price_currency`（旧字段 `currency` 保留，值相同）。两者不要直接相加或相除。
+
 ### 通用工具
 
 | 工具 | 用途 |
@@ -158,7 +160,7 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 | `ozon_ads_api_catalog` | 搜索全部 48 个广告接口 + 官方说明中给出的 12 个 `/json` 报表版本，或查看单个接口的参数与响应定义 |
 | `ozon_ads_api_call` | 按路径调用任一广告接口：路径参数和查询参数放 `params`，请求体放 `body` |
 
-- `ozon_ads_stats` 的活动汇总来自 `/api/client/statistics/campaign/product/json`（同步，不消耗限额）；商品明细来自异步活动报表 `/api/client/statistics/json`（每次最多 10 个活动，同一账号同时只生成 1 个，最多等 90 秒），包含本期内已移出活动的商品。`include_products=false` 只看活动汇总
+- `ozon_ads_stats` 的活动汇总来自 `/api/client/statistics/campaign/product/json`（同步，不消耗限额）；商品明细来自异步活动报表 `/api/client/statistics/json`（每次最多 10 个活动，同一账号同时只生成 1 个，最多等 90 秒），包含本期内已移出活动的商品。同一进程内同一广告账号的报表逐个生成：本服务记住每个广告账号最近提交的报表（UUID、提交时间），下一次提交前（`ozon_ads_stats` 和 `ozon_ads_api_call` 的报表提交，含外部流量报表）先在本次调用内查它的状态，等到 OK/ERROR（外部流量报表还有 TIMEOUT/CANCEL）或它已提交满 120 秒；查询失败不算完成，每次查询也受上一份报表剩余的等待上限约束。本次调用的时间预算内没等到就不提交并返回提示。报表提交不自动重试；已发出但结果未知（连接中断、超时、5xx）时，按“可能正在生成”处理，下一次提交等它满 120 秒。没有任何后台任务；相同查询同时进行时共用一份报表。`ozon_ads_stats` 整次调用（活动列表、汇总、取令牌、等待、重试、报表）共用一个 90 秒期限，超时即取消，不再发出后续请求。`include_products=false` 只看活动汇总
 - `/api/client/statistics/products/sku` 实测只接受今天或昨天（Ozon 返回 `date range must contain only today or yesterday`），所以不用于多天统计
 - `OZON_READ_ONLY=true` 时，改出价、启停活动、增删商品、开关“按订单付款”等 16 个写接口在发送前拦截（包括 `GET /api/client/campaign/all_sku_promo/activate` 这类用 GET 做写操作的接口）
 - 官方限制：每天总计 100 000 次；统计报表同一账号同时只能生成 1 个、一次最多 10 个活动、最长 62 天
@@ -185,13 +187,14 @@ Windows 上如果客户端找不到 `npx`，把 `command` 改为 `"cmd"`，`args
 
 其他接口文档未写具体数字，Ozon 仍可能返回 429。
 
-本地保护：同一进程内超出上述窗口时直接返回“约 N 秒后可再调用”，不发请求；限流接口的相同只读请求 5 分钟内返回缓存（`from_cache: true`）。本地计数只统计当前进程（含被 Ozon 拒绝的调用），以 Ozon 服务端为准。只读请求遇到 429/502/503/504 且 `Retry-After` ≤ 5 秒时重试一次；写请求从不自动重试。
+本地保护：同一进程内超出上述窗口时直接返回“约 N 秒后可再调用”，不发请求；限流接口的相同只读请求 5 分钟内返回缓存（`from_cache: true`）。本地计数只统计当前进程（含被 Ozon 拒绝的调用），以 Ozon 服务端为准。只读请求遇到 429/502/503/504 且 `Retry-After`（秒数或 HTTP 日期）≤ 5 秒时重试一次；每次实际发送（含重试、等过冷却之后）在发出前一刻计入上述窗口，并受每个账号的重试额度限制（并发失败时不会把请求量翻倍），等待时间加少量随机抖动。写请求从不自动重试。Ozon 返回 429 后，同一账号（同一 Client-Id 或广告 Client ID）的后续请求都先等过 `Retry-After`（最多按 60 秒计）：剩余不超过 5 秒就等待后发送，更长则直接返回“约 N 秒后可再调用”；有独立限额的接口（上表）只冷却该接口本身。
 
 **实测注意**：`/v1/analytics/data` 带 `sort` 参数的请求在 2026-10-26 连续被 Ozon 以“每秒限流”拒绝，同样的请求不带 `sort` 正常。`ozon_top_products` 因此不传 `sort`，一次取 1000 个 SKU 后本地排序。
 
 ## 参数校验
 
-- 必填、类型、嵌套、枚举、上下限、数组约束、日期与 int32/int64/uint64 格式、未知字段，发送前全部校验
+- 必填、类型、嵌套、枚举、上下限、数组约束、日期、date-time（RFC 3339，须带时区，如 `2026-10-01T00:00:00Z`；闰秒只接受 UTC 23:59:60）与 int32/int64/uint64 格式、未知字段，发送前全部校验。少数字段（如 `/v1/finance/balance` 的 `date_from`）规范类型是 date-time、说明和官方示例却是 `YYYY-MM-DD`，这些字段两种写法都接受
+- 整数参数超出 ±9007199254740991 时直接拒绝：JSON 解析时这类数字已被舍入（9007199254740993 会变成 …992），照发可能作用到别的对象
 - 482 个 schema 与原 Python 版逐个比对一致（3114 个校验用例结论相同），以下 8 处除外
 - 官方规范有 8 个 schema 把某字段列为必填、却没有定义该字段（如 `/v2/products/stocks` 的 `quant_size`，`/v1/cargoes/label/transport/status` 的 `operation_idd`），原实现因此无法调用这些接口。现在这些字段改为“已声明、不校验类型”的可选字段，说明里注明官方列为必填，最终以 Ozon 返回为准
 - 官方 `type=null` 的字段禁止传入，不猜测类型；`int`/`bool` 等书写错误按无歧义方式规范化

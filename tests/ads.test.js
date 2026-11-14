@@ -248,7 +248,7 @@ test('ozon_ads_stats: report submission errors and odd formats keep campaign tot
 
 test('ozon_ads_stats: when the report wait runs out, every remaining campaign is named', async () => {
   await withEnv({}, async () => {
-    setReportTimingForTests({ pollMs: 1, waitMs: 0 });
+    setReportTimingForTests({ pollMs: 1, waitMs: 40 });
     try {
       const ids = Array.from({ length: 12 }, (_, i) => String(i + 1));
       const submitted = [];
@@ -375,5 +375,768 @@ test('ozon_ads_api_catalog: search and describe', async () => {
     assert.equal(one.read_only, true);
     const missing = await callTool('ozon_ads_api_catalog', { endpoint: '/nope' });
     assert.equal(missing.isError, true);
+  });
+});
+
+// ---- review fixes (2026-11-14) -----------------------------------------------------------------
+
+test('ads: a bearer token in a network error never reaches the output, also after the token was replaced', async () => {
+  await withEnv({}, async () => {
+    const tokens = [];
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    let campaignCalls = 0;
+    setFetchForTests(async (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === TOKEN) {
+        tokens.push(`eyJ.long-bearer-${tokens.length + 1}-${'x'.repeat(40)}`);
+        return json({ access_token: tokens.at(-1), expires_in: 1800 });
+      }
+      campaignCalls += 1;
+      const auth = init.headers.Authorization;
+      if (campaignCalls === 1) {
+        // Still in flight while another call refreshes the token; fails afterwards, echoing its header.
+        await held;
+        throw new TypeError('fetch failed', { cause: Object.assign(new Error(`socket hang up (Authorization: ${auth})`), { code: 'ECONNRESET' }) });
+      }
+      if (campaignCalls === 2) return json({ error: 'expired' }, 401);
+      return json({ list: [] });
+    });
+    const first = callTool('ozon_ads_api_call', { endpoint: '/api/client/campaign', method: 'GET' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal((await callTool('ozon_ads_api_call', { endpoint: '/api/client/campaign', method: 'GET' })).isError, undefined);
+    assert.equal(tokens.length, 2, 'the token was replaced while the first request was in flight');
+    release();
+    const out = await first;
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /ECONNRESET.*Bearer \[已隐藏令牌\]/s);
+    for (const token of tokens) assert.ok(!out.content[0].text.includes(token));
+  });
+});
+
+test('ads: concurrent 429s are retried within the account budget, then the account cools down', async () => {
+  await withEnv({}, async () => {
+    const calls = mockOzon({ [TOKEN]: tokenRoute({ n: 0 }), '/api/client/campaign': () => json({}, 429, { 'retry-after': '0' }) });
+    const results = await Promise.allSettled(Array.from({ length: 10 }, () => adsRequest('/api/client/campaign')));
+    assert.ok(results.every((r) => r.status === 'rejected'));
+    assert.equal(calls.filter((c) => c.path === '/api/client/campaign').length, 14, '10 sends + 4 budgeted retries, not 20');
+
+    mockOzon({ [TOKEN]: tokenRoute({ n: 0 }), '/api/client/campaign': () => json({}, 429, { 'retry-after': '30' }) });
+    await assert.rejects(adsRequest('/api/client/campaign'), /HTTP 429.*Retry-After=30 秒/);
+    const later = mockOzon({});
+    await assert.rejects(adsRequest('/api/client/campaign', { params: { page: 2 } }), /限流保护：Ozon 刚对该账号返回 429/);
+    assert.equal(later.length, 0);
+  });
+});
+
+test('ads: a write whose response body breaks off reports an unknown outcome', async () => {
+  await withEnv({ OZON_READ_ONLY: 'false' }, async () => {
+    let sent = false;
+    const broken = () => new Response(new ReadableStream({
+      pull(controller) {
+        if (sent) controller.error(new TypeError('terminated', { cause: new Error('other side closed') }));
+        else {
+          sent = true;
+          controller.enqueue(new TextEncoder().encode('{"ok":'));
+        }
+      },
+    }), { headers: { 'content-type': 'application/json' } });
+    mockOzon({ [TOKEN]: tokenRoute({ n: 0 }), '/api/client/campaign/77/activate': broken });
+    await assert.rejects(adsRequest('/api/client/campaign/{campaignId}/activate', { method: 'POST', params: { campaignId: '77' } }),
+      /读取 Ozon 响应时连接中断.*other side closed.*写入结果未知/);
+  });
+});
+
+// Report routes for concurrent ozon_ads_stats calls: every submission gets its own UUID.
+function queuedReportRoutes(events, { statusGate } = {}) {
+  const { routes } = statsRoutes();
+  let submitted = 0;
+  const uuids = [];
+  const reportRoutes = {
+    '/api/client/statistics/json': async (body) => {
+      submitted += 1;
+      const uuid = `u-${submitted}`;
+      uuids.push(uuid);
+      events.push(`submit ${uuid} ${body.dateFrom}`);
+      return { UUID: uuid };
+    },
+    '/api/client/statistics/report': () => {
+      events.push('download');
+      return routes['/api/client/statistics/report']();
+    },
+  };
+  for (let i = 1; i <= 4; i += 1) {
+    reportRoutes[`/api/client/statistics/u-${i}`] = async () => {
+      if (statusGate) await statusGate;
+      if (!events.includes(`ok u-${i}`)) events.push(`ok u-${i}`);
+      return { state: 'OK' };
+    };
+  }
+  return { ...routes, ...reportRoutes, uuids };
+}
+
+// Reports Ozon is building at the same time: from submission until its status first reads OK.
+const inFlightMax = (events) => {
+  let open = 0;
+  let max = 0;
+  for (const e of events) {
+    if (e.startsWith('submit')) open += 1;
+    if (e.startsWith('ok ')) open -= 1;
+    max = Math.max(max, open);
+  }
+  return max;
+};
+
+test('ozon_ads_stats: concurrent calls on one account never have two reports in progress', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 1 });
+    try {
+      const events = [];
+      mockOzon(queuedReportRoutes(events));
+      const [a, b] = await Promise.all([
+        callTool('ozon_ads_stats', { date_from: '2026-11-03', date_to: '2026-11-09' }),
+        callTool('ozon_ads_stats', { date_from: '2026-11-02', date_to: '2026-11-08' }),
+      ]);
+      assert.equal(a.isError, undefined, a.content[0].text);
+      assert.equal(b.isError, undefined, b.content[0].text);
+      assert.equal(events.filter((e) => e.startsWith('submit')).length, 2);
+      assert.equal(inFlightMax(events), 1, JSON.stringify(events));
+      assert.equal(parse(a).products_complete, true);
+      assert.equal(parse(b).products_complete, true);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_stats: identical concurrent calls share one report', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 1 });
+    try {
+      const events = [];
+      let release;
+      const statusGate = new Promise((resolve) => { release = resolve; });
+      mockOzon(queuedReportRoutes(events, { statusGate }));
+      const args = { date_from: '2026-11-03', date_to: '2026-11-09' };
+      const pending = Promise.all([callTool('ozon_ads_stats', args), callTool('ozon_ads_stats', args)]);
+      setTimeout(release, 30);
+      const [a, b] = (await pending).map(parse);
+      assert.equal(events.filter((e) => e.startsWith('submit')).length, 1, JSON.stringify(events));
+      assert.deepEqual(a.products, b.products);
+      assert.ok([a, b].some((out) => out.notes.some((n) => /共用/.test(n))));
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_api_call: a report submission waits for the report ozon_ads_stats is generating', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 1 });
+    try {
+      const events = [];
+      let release;
+      const statusGate = new Promise((resolve) => { release = resolve; });
+      mockOzon(queuedReportRoutes(events, { statusGate }));
+      const stats = callTool('ozon_ads_stats', { date_from: '2026-11-03', date_to: '2026-11-09' });
+      while (!events.length) await new Promise((resolve) => setTimeout(resolve, 2));
+      const generic = callTool('ozon_ads_api_call', { endpoint: '/api/client/statistics/json', method: 'POST',
+        body: { campaigns: ['10'], dateFrom: '2026-10-01', dateTo: '2026-10-02' } });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(events, ['submit u-1 2026-11-03'], 'the generic submission is held back');
+      release();
+      assert.equal((await stats).isError, undefined);
+      assert.equal(parse(await generic).data.UUID, 'u-2');
+      assert.ok(events.indexOf('ok u-1') < events.indexOf('submit u-2 2026-10-01'), JSON.stringify(events));
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+// ---- second review round (2026-11-14) ----------------------------------------------------------
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('ads: a token in use stays hidden even after it expires and many newer tokens push history out', async () => {
+  const { rememberToken } = await import('../src/privacy.js');
+  await withEnv({}, async () => {
+    const token = `short-lived-${'z'.repeat(40)}`;
+    setFetchForTests(async (url, init) => {
+      if (new URL(url).pathname === TOKEN) return json({ access_token: token, expires_in: 0.001 });
+      await pause(5); // the token has expired by now
+      for (let i = 0; i < 200; i += 1) rememberToken(`old-${String(i).padStart(3, '0')}-tok`, Date.now() - 1);
+      throw new TypeError('fetch failed', { cause: Object.assign(new Error(`reset (${init.headers.Authorization})`), { code: 'ECONNRESET' }) });
+    });
+    const out = await callTool('ozon_ads_api_call', { endpoint: '/api/client/campaign', method: 'GET' });
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /Bearer \[已隐藏令牌\]/);
+    assert.ok(!out.content[0].text.includes(token));
+  });
+});
+
+test('ads: a 429 from the token endpoint cools the account down; Retry-After is read', async () => {
+  await withEnv({}, async () => {
+    const calls = mockOzon({ [TOKEN]: () => json({ error: 'slow down' }, 429, { 'retry-after': '30' }), '/api/client/campaign': () => ({ list: [] }) });
+    await assert.rejects(adsRequest('/api/client/campaign'), /授权接口限流（HTTP 429）：Retry-After=30 秒/);
+    await assert.rejects(adsRequest('/api/client/campaign'), /限流保护：Ozon 刚对该账号返回 429.*约 30 秒/);
+    assert.equal(calls.length, 1, 'the second call did not ask for a token again');
+  });
+  await withEnv({}, async () => {
+    const retryAt = new Date(Date.now() + 20_000).toUTCString();
+    const calls = mockOzon({ [TOKEN]: () => json({}, 429, { 'retry-after': retryAt }) });
+    await assert.rejects(adsRequest('/api/client/campaign'), /Retry-After=(19|20) 秒/);
+    await assert.rejects(adsRequest('/api/client/campaign'), /限流保护/);
+    assert.equal(calls.length, 1);
+  });
+});
+
+test('ads: a write whose error response breaks off says the outcome is unknown', async () => {
+  await withEnv({ OZON_READ_ONLY: 'false' }, async () => {
+    let sent = false;
+    const broken = () => new Response(new ReadableStream({
+      pull(controller) {
+        if (sent) controller.error(new TypeError('terminated', { cause: new Error('other side closed') }));
+        else {
+          sent = true;
+          controller.enqueue(new TextEncoder().encode('{"error":'));
+        }
+      },
+    }), { status: 502, headers: { 'content-type': 'application/json' } });
+    mockOzon({ [TOKEN]: tokenRoute({ n: 0 }), '/api/client/campaign/77/activate': broken });
+    await assert.rejects(adsRequest('/api/client/campaign/{campaignId}/activate', { method: 'POST', params: { campaignId: '77' } }),
+      /HTTP 502 POST .*读取 Ozon 响应时连接中断.*other side closed.*写入结果未知/s);
+  });
+});
+
+// Generic report submissions with a status per UUID that the test controls.
+function reportSlotRoutes(events, states) {
+  let n = 0;
+  const routes = { [TOKEN]: tokenRoute({ n: 0 }) };
+  const submit = (body) => {
+    n += 1;
+    events.push(`submit u-${n}`);
+    return { UUID: `u-${n}` };
+  };
+  routes['/api/client/statistics/json'] = submit;
+  for (let i = 1; i <= 4; i += 1) {
+    routes[`/api/client/statistics/u-${i}`] = () => {
+      const state = states[`u-${i}`] ?? 'OK';
+      if (typeof state === 'function') return state();
+      if (state === 'OK' && !events.includes(`u-${i} OK`)) events.push(`u-${i} OK`);
+      return { state };
+    };
+  }
+  return routes;
+}
+
+const genericReport = (dateFrom) => callTool('ozon_ads_api_call', { endpoint: '/api/client/statistics/json', method: 'POST',
+  body: { campaigns: ['10'], dateFrom, dateTo: dateFrom } });
+
+test('ozon_ads_api_call: the next report waits until Ozon has finished the previous one (tracked by UUID)', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2 });
+    try {
+      const events = [];
+      const states = { 'u-1': 'IN_PROGRESS' };
+      mockOzon(reportSlotRoutes(events, states));
+      assert.equal(parse(await genericReport('2026-10-01')).data.UUID, 'u-1');
+      const second = genericReport('2026-10-02');
+      await pause(30);
+      assert.deepEqual(events, ['submit u-1'], 'u-1 is still being built');
+      states['u-1'] = 'OK';
+      assert.equal(parse(await second).data.UUID, 'u-2');
+      assert.deepEqual(events.slice(0, 3), ['submit u-1', 'u-1 OK', 'submit u-2']);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_stats after a generic submission waits for that report, at most until it is maxAgeMs old', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 60 });
+    try {
+      const events = [];
+      const { routes } = statsRoutes();
+      // u-1 (generic) never finishes: the next submission polls it until it is maxAgeMs old.
+      mockOzon({ ...routes, ...reportSlotRoutes(events, { 'u-1': 'IN_PROGRESS' }), '/api/client/statistics/report': routes['/api/client/statistics/report'] });
+      await genericReport('2026-10-01');
+      const started = Date.now();
+      const out = parse(await callTool('ozon_ads_stats', { date_from: '2026-11-03', date_to: '2026-11-09' }));
+      assert.ok(Date.now() - started >= 50, 'waited for the generic report');
+      assert.equal(out.products_complete, true, JSON.stringify(out.notes));
+      assert.deepEqual(events.filter((e) => e.startsWith('submit')), ['submit u-1', 'submit u-2']);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_stats: a hung status request cannot starve the account; nothing is submitted in the background', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 1, waitMs: 80, maxAgeMs: 20 });
+    try {
+      const events = [];
+      const hang = () => new Promise(() => {});
+      const { routes } = statsRoutes();
+      mockOzon({ ...routes, ...reportSlotRoutes(events, { 'u-1': hang, 'u-2': hang }) });
+      const started = Date.now();
+      const a = parse(await callTool('ozon_ads_stats', { date_from: '2026-11-03', date_to: '2026-11-09' }));
+      const b = parse(await callTool('ozon_ads_stats', { date_from: '2026-11-02', date_to: '2026-11-08' }));
+      assert.ok(Date.now() - started < 2000, 'both calls end within their time budget');
+      for (const out of [a, b]) {
+        assert.equal(out.products_complete, false);
+        assert.ok(out.notes.some((n) => /未生成完/.test(n) && /UUID=u-/.test(n)), JSON.stringify(out.notes));
+      }
+      assert.deepEqual(events, ['submit u-1', 'submit u-2'], 'the second call was not starved');
+      await pause(100);
+      assert.deepEqual(events, ['submit u-1', 'submit u-2'], 'no submission after the calls returned');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_api_call: a submission whose budget runs out while the previous report is built never runs later', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, waitMs: 30, maxAgeMs: 150 });
+    try {
+      const events = [];
+      mockOzon(reportSlotRoutes(events, { 'u-1': 'IN_PROGRESS' }));
+      await genericReport('2026-10-01');
+      const late = await genericReport('2026-10-02');
+      assert.equal(late.isError, true);
+      assert.match(late.content[0].text, /上一份报表（UUID=u-1）还在生成.*未提交新报表/);
+      await pause(200); // u-1 is past maxAgeMs by now
+      assert.deepEqual(events.filter((e) => e.startsWith('submit')), ['submit u-1']);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+// ---- third review round (2026-11-14): no background work, one deadline per call ---------------
+
+test('ozon_ads_stats: one deadline from entry covers the token fetch; nothing is sent once it is used up', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ waitMs: 20 });
+    try {
+      const calls = mockOzon({
+        [TOKEN]: async () => {
+          await pause(60);
+          return { access_token: 'late-token', expires_in: 1800 };
+        },
+        '/api/client/campaign': () => ({ list: [] }),
+      });
+      const started = Date.now();
+      const out = await callTool('ozon_ads_stats', {});
+      assert.ok(Date.now() - started < 50, 'ended at the deadline, not when the token arrived');
+      assert.equal(out.isError, true);
+      assert.match(out.content[0].text, /广告统计在 \d+ 秒内未完成，已取消剩余请求/);
+      await pause(100);
+      assert.deepEqual(calls.map((c) => c.path), [TOKEN], 'the late token was not used to send anything');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_stats: the deadline covers the campaign phase, also with include_products=false', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ waitMs: 20 });
+    try {
+      mockOzon({
+        [TOKEN]: tokenRoute({ n: 0 }),
+        '/api/client/campaign': async () => {
+          await pause(60);
+          return { list: [] };
+        },
+      });
+      const started = Date.now();
+      const out = await callTool('ozon_ads_stats', { include_products: false });
+      assert.ok(Date.now() - started < 50);
+      assert.match(out.content[0].text, /广告统计在 \d+ 秒内未完成/);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_stats: a status response whose body never ends is cut off by the deadline', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 1, waitMs: 60 });
+    try {
+      const { routes } = statsRoutes();
+      const endless = () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"state":'));
+        },
+      }), { headers: { 'content-type': 'application/json' } });
+      mockOzon({ ...routes, '/api/client/statistics/u-1': endless });
+      const started = Date.now();
+      const out = parse(await callTool('ozon_ads_stats', { date_from: '2026-11-03', date_to: '2026-11-09' }));
+      assert.ok(Date.now() - started < 1000);
+      assert.equal(out.products_complete, false);
+      assert.ok(out.notes.some((n) => /未生成完/.test(n) && /UUID=u-1/.test(n)), JSON.stringify(out.notes));
+      assert.equal(out.campaigns.find((c) => c.id === '10').clicks, 400, 'campaign totals are kept');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ads: cancelling during a retry delay sends nothing more', async () => {
+  const { timeLimit } = await import('../src/ads/http.js');
+  await withEnv({}, async () => {
+    const calls = mockOzon({ [TOKEN]: tokenRoute({ n: 0 }), '/api/client/campaign': () => json({}, 503, { 'retry-after': '0.5' }) });
+    const limit = timeLimit(50);
+    const started = Date.now();
+    await assert.rejects(adsRequest('/api/client/campaign', { signal: limit.signal }), /时间预算，请求未发送/);
+    limit.done();
+    assert.ok(Date.now() - started < 300, 'the retry delay was cut short');
+    await pause(700);
+    assert.equal(calls.filter((c) => c.path === '/api/client/campaign').length, 1);
+  });
+});
+
+test('untilAborted leaves no unhandled rejection behind', async () => {
+  const { untilAborted } = await import('../src/ads/http.js');
+  const seen = [];
+  const listener = (reason) => seen.push(reason);
+  process.on('unhandledRejection', listener);
+  try {
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(untilAborted(Promise.reject(new Error('rejected while already aborted')), aborted.signal));
+    const later = new AbortController();
+    let fail;
+    const raced = untilAborted(new Promise((_, reject) => {
+      fail = reject;
+    }), later.signal);
+    later.abort();
+    await assert.rejects(raced);
+    fail(new Error('rejected after the race was lost'));
+    await pause(20);
+    assert.deepEqual(seen, []);
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
+});
+
+test('ozon_ads_api_call: a failed status poll is not a final state; the next report still waits', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2 });
+    try {
+      const events = [];
+      let failures = 0;
+      const states = {
+        'u-1': () => {
+          if (failures < 2) {
+            failures += 1;
+            return json({ message: 'internal' }, 500);
+          }
+          return { state: 'IN_PROGRESS' };
+        },
+      };
+      mockOzon(reportSlotRoutes(events, states));
+      await genericReport('2026-10-01');
+      const second = genericReport('2026-10-02');
+      await pause(40);
+      assert.equal(failures, 2);
+      assert.deepEqual(events, ['submit u-1'], 'two failed polls did not free the slot');
+      states['u-1'] = 'OK';
+      assert.equal(parse(await second).data.UUID, 'u-2');
+      assert.deepEqual(events, ['submit u-1', 'u-1 OK', 'submit u-2']);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_api_call: vendor reports take the slot and are checked on the vendor status endpoint', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2 });
+    try {
+      let vendorState = 'IN_PROGRESS';
+      const calls = mockOzon({
+        [TOKEN]: tokenRoute({ n: 0 }),
+        '/api/client/vendors/statistics': () => ({ UUID: 'v-1', vendor: true }),
+        '/api/client/vendors/statistics/v-1': () => ({ state: vendorState }),
+        '/api/client/statistics/json': () => ({ UUID: 'u-1' }),
+      });
+      const vendor = parse(await callTool('ozon_ads_api_call', { endpoint: '/api/client/vendors/statistics', method: 'POST',
+        body: { dateFrom: '2026-10-01', dateTo: '2026-10-02', type: 'ORDERS' } }));
+      assert.equal(vendor.data.UUID, 'v-1');
+      const next = genericReport('2026-10-03');
+      await pause(30);
+      assert.equal(calls.filter((c) => c.path === '/api/client/statistics/json').length, 0, 'waits for the vendor report');
+      vendorState = 'CANCEL'; // a final state of vendor reports
+      assert.equal(parse(await next).data.UUID, 'u-1');
+      assert.ok(calls.some((c) => c.path === '/api/client/vendors/statistics/v-1'));
+      assert.ok(!calls.some((c) => c.path === '/api/client/statistics/v-1'), 'not the ordinary status endpoint');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_api_call: a status the caller already read as final spares the next submission a poll', async () => {
+  await withEnv({}, async () => {
+    const events = [];
+    const states = { 'u-1': 'IN_PROGRESS' };
+    const calls = mockOzon(reportSlotRoutes(events, states));
+    await genericReport('2026-10-01');
+    states['u-1'] = 'OK';
+    const status = parse(await callTool('ozon_ads_api_call', { endpoint: '/api/client/statistics/{UUID}', method: 'GET', params: { UUID: 'u-1' } }));
+    assert.equal(status.data.state, 'OK');
+    await genericReport('2026-10-02');
+    assert.equal(calls.filter((c) => c.path === '/api/client/statistics/u-1').length, 1);
+  });
+});
+
+test('a pending ads call and a finished report submission do not keep the process alive', async () => {
+  const { spawn } = await import('node:child_process');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'ads-hung-exit.mjs');
+  const started = Date.now();
+  const { code, stdout } = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [fixture], { stdio: ['ignore', 'pipe', 'inherit'] });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('the process was kept alive'));
+    }, 10_000);
+    child.on('exit', (exitCode) => {
+      clearTimeout(timer);
+      resolve({ code: exitCode, stdout: output });
+    });
+  });
+  assert.equal(code, 0);
+  assert.match(stdout, /submitted u-1/);
+  assert.ok(Date.now() - started < 5000, `exited after ${Date.now() - started} ms`);
+});
+
+// ---- fourth review round (2026-11-14) ----------------------------------------------------------
+
+// Fails a test instead of letting it hang when something waits forever.
+const within = (promise, ms, what) => Promise.race([promise, new Promise((_, reject) => {
+  setTimeout(() => reject(new Error(`${what}: still pending after ${ms} ms`)), ms).unref();
+})]);
+
+// A response whose body cancel never settles (a stalled connection).
+const stuckBody = (status, headers = {}) => new Response(new ReadableStream({
+  start(controller) {
+    controller.enqueue(new TextEncoder().encode('{}'));
+  },
+  cancel() {
+    return new Promise(() => {});
+  },
+}), { status, headers: { 'content-type': 'application/json', ...headers } });
+
+test('ads: a body cancel that never settles holds neither the call nor the report slot', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2 });
+    try {
+      let submits = 0;
+      mockOzon({
+        [TOKEN]: tokenRoute({ n: 0 }),
+        '/api/client/statistics/json': () => {
+          submits += 1;
+          return submits === 1 ? stuckBody(401) : { UUID: `u-${submits - 1}` };
+        },
+        '/api/client/statistics/u-1': () => ({ state: 'OK' }),
+        '/api/client/campaign': () => stuckBody(302, { location: 'https://example.com/' }),
+      });
+      // 401 → the body is dropped, a new token fetched, the submission resent.
+      assert.equal(parse(await within(genericReport('2026-10-01'), 1000, 'first submission')).data.UUID, 'u-1');
+      assert.equal(parse(await within(genericReport('2026-10-02'), 1000, 'second submission')).data.UUID, 'u-2', 'the slot was released');
+      await within(assert.rejects(adsRequest('/api/client/campaign'), /重定向/), 1000, 'redirect');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('ozon_ads_stats: a call that joins a shared report keeps its own deadline', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, waitMs: 100 });
+    try {
+      const { routes } = statsRoutes();
+      let lists = 0;
+      mockOzon({
+        ...routes,
+        // The first call's campaign list is slow, so it reaches the report after the second call created it.
+        '/api/client/campaign': async () => {
+          lists += 1;
+          if (lists === 1) await pause(75);
+          return routes['/api/client/campaign']();
+        },
+        '/api/client/statistics/u-1': () => ({ state: 'IN_PROGRESS' }),
+      });
+      const args = { date_from: '2026-11-03', date_to: '2026-11-09' };
+      const startedA = Date.now();
+      const a = callTool('ozon_ads_stats', args);
+      await pause(50);
+      const b = callTool('ozon_ads_stats', args);
+      const outA = parse(await a);
+      const elapsedA = Date.now() - startedA;
+      assert.ok(elapsedA < 135, `the first call ended at its own deadline, after ${elapsedA} ms`);
+      assert.equal(outA.products_complete, false);
+      assert.ok(outA.notes.some((n) => /共用/.test(n)), JSON.stringify(outA.notes));
+      assert.equal(parse(await b).products_complete, false, 'the shared job ran on for the second call');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('report submissions: sent without a definite answer, the next one waits until it ages out', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 80, waitMs: 400 });
+    try {
+      const events = [];
+      let submits = 0;
+      const routes = reportSlotRoutes(events, {});
+      mockOzon({
+        ...routes,
+        '/api/client/statistics/json': (body) => {
+          submits += 1;
+          // Ozon accepted the first one, but its answer breaks off.
+          if (submits === 1) return new Response(new ReadableStream({ start(c) { c.error(new TypeError('terminated')); } }), { headers: { 'content-type': 'application/json' } });
+          return routes['/api/client/statistics/json'](body);
+        },
+      });
+      const started = Date.now();
+      assert.equal((await genericReport('2026-10-01')).isError, true);
+      assert.equal(parse(await genericReport('2026-10-02')).data.UUID, 'u-1');
+      assert.ok(Date.now() - started >= 75, 'waited for the unknown submission to age out');
+      assert.equal(submits, 2);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 400, waitMs: 40 });
+    try {
+      let submits = 0;
+      mockOzon({
+        [TOKEN]: tokenRoute({ n: 0 }),
+        '/api/client/statistics/json': () => {
+          submits += 1;
+          return json({ message: 'bad gateway' }, 502);
+        },
+      });
+      assert.equal((await genericReport('2026-10-01')).isError, true);
+      assert.equal(submits, 1, 'a report submission is not retried like a plain read');
+      const started = Date.now();
+      const out = await genericReport('2026-10-02');
+      assert.equal(out.isError, true);
+      assert.match(out.content[0].text, /时间预算已用完.*上一份报表（已提交但结果未知）/);
+      assert.ok(Date.now() - started < 30, 'refused at once: the budget cannot cover the wait');
+      assert.equal(submits, 1);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('report submissions: one never sent, or refused outright, holds nothing back', async () => {
+  const { noteRateLimited, resetRateLimits } = await import('../src/ratelimit.js');
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 400 });
+    try {
+      const events = [];
+      mockOzon(reportSlotRoutes(events, {}));
+      noteRateLimited({ path: '/api/client/campaign' }, `perf:${PERF_ID}`, 30_000);
+      assert.match((await genericReport('2026-10-01')).content[0].text, /限流保护/);
+      resetRateLimits();
+      const started = Date.now();
+      assert.equal(parse(await genericReport('2026-10-02')).data.UUID, 'u-1');
+      assert.ok(Date.now() - started < 50, 'nothing was sent, so nothing to wait for');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 400 });
+    try {
+      let submits = 0;
+      mockOzon({ [TOKEN]: tokenRoute({ n: 0 }), '/api/client/statistics/json': () => {
+        submits += 1;
+        return submits === 1 ? json({ error: 'bad period' }, 400) : { UUID: 'u-1' };
+      } });
+      assert.equal((await genericReport('2026-10-01')).isError, true);
+      const started = Date.now();
+      assert.equal(parse(await genericReport('2026-10-02')).data.UUID, 'u-1');
+      assert.ok(Date.now() - started < 50, 'a 400 is a definite refusal');
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('report submissions: a hanging status poll is cut off by the previous report\'s age, not only the budget', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 40, waitMs: 400 });
+    try {
+      const events = [];
+      mockOzon(reportSlotRoutes(events, { 'u-1': () => new Promise(() => {}) }));
+      await genericReport('2026-10-01');
+      const started = Date.now();
+      assert.equal(parse(await genericReport('2026-10-02')).data.UUID, 'u-2', 'the age ran out: submitted');
+      assert.ok(Date.now() - started < 200, `took ${Date.now() - started} ms`);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 400, waitMs: 40 });
+    try {
+      const events = [];
+      mockOzon(reportSlotRoutes(events, { 'u-1': () => new Promise(() => {}) }));
+      await genericReport('2026-10-01');
+      const out = await genericReport('2026-10-02');
+      assert.equal(out.isError, true);
+      assert.match(out.content[0].text, /本次调用的时间预算已用完.*上一份报表（UUID=u-1）.*未提交新报表/);
+      assert.deepEqual(events, ['submit u-1']);
+    } finally {
+      setReportTimingForTests(null);
+    }
+  });
+});
+
+test('report submissions: a failed token request is not a submission and holds nothing back', async () => {
+  await withEnv({}, async () => {
+    setReportTimingForTests({ pollMs: 2, maxAgeMs: 400 });
+    try {
+      let tokens = 0;
+      let submits = 0;
+      mockOzon({
+        [TOKEN]: () => {
+          tokens += 1;
+          if (tokens === 1) throw new TypeError('fetch failed', { cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) });
+          return { access_token: `tok-${tokens}`, expires_in: 1800 };
+        },
+        '/api/client/statistics/json': () => {
+          submits += 1;
+          return { UUID: `u-${submits}` };
+        },
+      });
+      const first = await genericReport('2026-10-01');
+      assert.equal(first.isError, true);
+      assert.match(first.content[0].text, /ECONNRESET/);
+      assert.equal(submits, 0, 'no report request went out');
+      const started = Date.now();
+      assert.equal(parse(await genericReport('2026-10-02')).data.UUID, 'u-1');
+      assert.ok(Date.now() - started < 100, `held back for ${Date.now() - started} ms`);
+    } finally {
+      setReportTimingForTests(null);
+    }
   });
 });

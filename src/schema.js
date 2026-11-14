@@ -154,10 +154,19 @@ function intFormat(format, value) {
     const n = BigInt(value);
     return n >= min && n < max;
   }
-  if (typeof value !== 'number' || !Number.isInteger(value)) return false;
+  // A JSON number beyond 2^53 has already been rounded by the time it reaches us.
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) return false;
   const n = BigInt(value);
   return n >= min && n < max;
 }
+
+// An integer argument beyond ±(2^53 − 1) was rounded while the tool call's JSON was parsed:
+// 9007199254740993 arrives as 9007199254740992 and would address a different object.
+const safeInteger = (enabled, value) => !enabled || typeof value !== 'number' || Number.isSafeInteger(value);
+const UNSAFE_INTEGER = '整数超出安全范围（绝对值大于 9007199254740991），JSON 解析时已被舍入、不再是原值；为免发往错误对象，未发送请求。'
+  + '核对该数值；若该字段也接受字符串，请按字符串传入';
+const isUnsafeNumber = (value) => typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value);
+const hasIntegerType = (type) => type === 'integer' || (Array.isArray(type) && type.includes('integer'));
 
 function isDate(value) {
   if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(value)) return false;
@@ -168,15 +177,38 @@ function isDate(value) {
 const isLeap = (y) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
 const daysIn = (y, m) => [31, isLeap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
 
+// RFC 3339 date-time, as JSON Schema defines the format: a real calendar date, a real time of day
+// and an explicit offset (Z or ±hh:mm), e.g. 2026-10-01T00:00:00Z or 2026-10-01T03:00:00.000+03:00.
+// A leap second (:60) is valid only where it can occur: at 23:59:60 UTC, e.g. 2016-12-31T23:59:60Z.
+const DATE_TIME = /^([0-9]{4}-[0-9]{2}-[0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?(?:[Zz]|([+-])([0-9]{2}):([0-9]{2}))$/;
+
+export function isDateTime(value) {
+  const match = DATE_TIME.exec(value);
+  if (!match || !isDate(match[1])) return false;
+  const [hour, minute, second] = match.slice(2, 5).map(Number);
+  const [sign, offsetHour, offsetMinute] = [match[5] === '-' ? -1 : 1, Number(match[6] ?? 0), Number(match[7] ?? 0)];
+  if (hour > 23 || minute > 59 || second > 60 || offsetHour > 23 || offsetMinute > 59) return false;
+  if (second < 60) return true;
+  const utcMinute = (((hour * 60 + minute - sign * (offsetHour * 60 + offsetMinute)) % 1440) + 1440) % 1440;
+  return utcMinute === 23 * 60 + 59;
+}
+
+// A few fields are typed date-time while their own description (and the official example) asks
+// for `YYYY-MM-DD`, e.g. /v1/finance/balance date_from. Ozon accepts the date there, so either form passes.
+const DATE_ONLY_DESCRIBED = /`YYYY-MM-DD`/;
+const dateTimeFormat = (node) => (DATE_ONLY_DESCRIBED.test(String(node.description ?? '')) ? 'date-or-date-time' : 'date-time');
+
 // Formats without a checker are ignored, matching the Python jsonschema behaviour this replaces.
 function validationCopy(node) {
   if (Array.isArray(node)) return node.map(validationCopy);
   if (!isObject(node)) return node;
   const out = {};
+  if (hasIntegerType(node.type)) out.ozonSafeInteger = true;
   for (const [key, value] of Object.entries(node)) {
     if (key === 'format' && typeof value === 'string') {
       if (value in INT_RANGES) out.ozonIntFormat = value;
       else if (value === 'date') out.format = 'date';
+      else if (value === 'date-time') out.format = dateTimeFormat(node);
     } else if (['properties', 'patternProperties', '$defs'].includes(key) && isObject(value)) {
       out[key] = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, validationCopy(v)]));
     } else if (['items', 'additionalProperties', 'not', 'if', 'then', 'else'].includes(key)) {
@@ -192,7 +224,10 @@ function validationCopy(node) {
 
 const ajv = new Ajv2020({ strict: false, allErrors: true, verbose: true, logger: false });
 ajv.addFormat('date', { type: 'string', validate: isDate });
+ajv.addFormat('date-time', { type: 'string', validate: isDateTime });
+ajv.addFormat('date-or-date-time', { type: 'string', validate: (value) => isDate(value) || isDateTime(value) });
 ajv.addKeyword({ keyword: 'ozonIntFormat', schemaType: 'string', validate: intFormat });
+ajv.addKeyword({ keyword: 'ozonSafeInteger', schemaType: 'boolean', validate: safeInteger });
 
 const validators = new Map();
 export function compileSchema(key, schema) {
@@ -210,6 +245,7 @@ export function formatErrors(errors, limit = 8) {
     const at = pointerToPath(error.instancePath);
     if (error.keyword === 'required') return `${at} 缺少必填字段 ${error.params.missingProperty}`;
     if (error.keyword === 'additionalProperties') return `${at} 存在官方规范未定义的字段 ${error.params.additionalProperty}`;
+    if (error.keyword === 'ozonSafeInteger' || (error.keyword === 'ozonIntFormat' && isUnsafeNumber(error.data))) return `${at} ${UNSAFE_INTEGER}`;
     const keyword = error.keyword === 'ozonIntFormat' ? 'format' : error.keyword;
     return `${at} 不符合 ${keyword} 约束（规则：${JSON.stringify(error.schema)}）`;
   });

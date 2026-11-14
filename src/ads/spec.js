@@ -28,6 +28,25 @@ export const READ_ONLY_IDS = new Set([
   'VendorStatisticsSubmitRequest', 'VendorStatisticsListReports', 'VendorStatisticsCheck', 'GetVendorTag',
 ]);
 
+// Asynchronous report submissions (each answers with a UUID to poll). Ozon builds one report at a
+// time per account, so these go through the account's report slot (see src/ads/reports.js), and
+// the status of each is read from its own endpoint: vendor (external traffic) reports have theirs.
+const REPORT_SUBMIT_IDS = new Set([
+  'SubmitRequest', 'VideoCampaignsSubmitRequest', 'AttributionSubmitRequest', 'SearchPromoOrdersReportSubmitRequest',
+  'SearchPromoProductsReportSubmitRequest', 'GenerateAllSkuPromoOrdersReport', 'GenerateAllSkuPromoProductsReport',
+  'ExternalStatistics_StatisticsPhrasesSubmitRequest2', 'VendorStatisticsSubmitRequest',
+]);
+const baseId = (op) => op.operation_id.replace(/_json$/, '');
+export const isReportSubmit = (op) => REPORT_SUBMIT_IDS.has(baseId(op));
+export const REPORT_STATUS_PATH = '/api/client/statistics/{UUID}';
+export const VENDOR_REPORT_STATUS_PATH = '/api/client/vendors/statistics/{UUID}';
+// Where a submission's report status is read: the endpoint and its fixed query parameters (the
+// vendor endpoint requires vendor=true, per its official description).
+export const REPORT_STATUS = Object.freeze({ path: REPORT_STATUS_PATH, params: {} });
+const VENDOR_REPORT_STATUS = Object.freeze({ path: VENDOR_REPORT_STATUS_PATH, params: { vendor: true } });
+export const reportStatus = (op) => (baseId(op) === 'VendorStatisticsSubmitRequest' ? VENDOR_REPORT_STATUS : REPORT_STATUS);
+export const isReportStatus = (op) => op.method === 'GET' && [REPORT_STATUS_PATH, VENDOR_REPORT_STATUS_PATH].includes(op.path);
+
 // Writes include GET endpoints that switch promotion on/off or set bids.
 export const WRITE_IDS = new Set([
   'CreateProductCampaignCPCV2', 'ActivateCampaign', 'DeactivateCampaign', 'PatchProductCampaign', 'AddProducts', 'UpdateProducts',

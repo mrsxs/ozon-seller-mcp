@@ -2,10 +2,14 @@
 // keep-alive connection reuse, local rate-limit protection.
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { setTimeout as wait } from 'node:timers/promises';
 import { Agent, EnvHttpProxyAgent, FormData, ProxyAgent, fetch as undiciFetch } from 'undici';
-import { OzonError } from './errors.js';
+import { OzonError, RateLimitError } from './errors.js';
 import { redact } from './privacy.js';
-import { afterSuccess, beforeRequest, rateLimitText, shareInflight } from './ratelimit.js';
+import {
+  DEFAULT_RETRY_MS, MAX_RETRY_WAIT_MS, admitRetry, admitSend, afterSuccess, awaitCooldown, beforeRequest, noteRateLimited, parseRetryAfter,
+  rateLimitText, shareInflight, withJitter,
+} from './ratelimit.js';
 import { enforceMode, validate } from './schema.js';
 import { multiShop, shopForPath } from './shops.js';
 import { findOperation, mediaSource } from './spec.js';
@@ -15,6 +19,8 @@ export const BASE_URL = 'https://api-seller.ozon.ru';
 const USER_AGENT = 'Ozon-Seller-MCP/2.1';
 const OAUTH_TAGS = new Set(['DeliveryAPI', 'OrderAPI', 'FboPostingAPI', 'CancelReasonAPI']);
 const MAX_RESPONSE = 20_000_000;
+export const RETRY_STATUSES = new Set([429, 502, 503, 504]);
+export const WRITE_UNKNOWN = ' 写入结果未知，请先查询业务状态，不要自动重试。';
 
 const HOST = new URL(BASE_URL).host;
 const PROXY_SCHEMES = new Set(['http:', 'https:', 'socks:', 'socks5:']);
@@ -212,7 +218,11 @@ JSON.parse('1', (key, value, context) => {
 });
 
 // Fallback for runtimes without reviver `context.source` (Node 20): quote unsafe integer
-// literals outside strings before parsing.
+// literals outside strings before parsing. Each number is read as one whole JSON token
+// (sign, integer part, fraction, exponent), so only a complete integer token is ever quoted:
+// the digits after a decimal point or an exponent are never mistaken for a number of their own.
+const NUMBER_TOKEN = /-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/y;
+
 export function quoteBigIntegers(text) {
   let out = '';
   let last = 0;
@@ -227,16 +237,17 @@ export function quoteBigIntegers(text) {
     if (c === '"') {
       inString = true;
     } else if (c === '-' || (c >= '0' && c <= '9')) {
-      let j = i + (c === '-' ? 1 : 0);
-      while (j < text.length && text[j] >= '0' && text[j] <= '9') j += 1;
-      const next = text[j];
-      const literal = text.slice(i, j);
-      if (next !== '.' && next !== 'e' && next !== 'E' && literal.replace('-', '').length >= 16
-          && !Number.isSafeInteger(Number(literal))) {
+      NUMBER_TOKEN.lastIndex = i;
+      const match = NUMBER_TOKEN.exec(text);
+      // Not a JSON number (e.g. a lone "-"): leave it for JSON.parse to reject.
+      if (!match) continue;
+      const literal = match[0];
+      const integer = match[1] === undefined && match[2] === undefined;
+      if (integer && literal.replace('-', '').length >= 16 && !Number.isSafeInteger(Number(literal))) {
         out += text.slice(last, i) + '"' + literal + '"';
-        last = j;
+        last = i + literal.length;
       }
-      i = j - 1;
+      i += literal.length - 1;
     }
   }
   return last ? out + text.slice(last) : text;
@@ -253,21 +264,62 @@ export function parseJson(text) {
   });
 }
 
-export async function readCapped(response) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of response.body ?? []) {
-    size += chunk.length;
-    if (size > MAX_RESPONSE) {
-      await response.body.cancel().catch(() => {});
-      throw new OzonError('响应过大，请缩小分页大小。');
-    }
-    chunks.push(chunk);
+// Drops a body that will not be read. Fire-and-forget, with the rejection handled: a cancel that
+// never settles (a stalled connection) must not hold the call, or a queue slot it owns.
+export function discardBody(response) {
+  try {
+    response.body?.cancel().catch(() => {});
+  } catch {
+    // nothing left to release
   }
-  return Buffer.concat(chunks);
 }
 
-export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// An explicit reader, not `for await`: leaving a `for await` loop early awaits the stream's cancel(),
+// which may never settle. At the cutoff the cancel is fired and not awaited.
+export async function readCapped(response) {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return Buffer.concat(chunks);
+    size += value.length;
+    if (size > MAX_RESPONSE) {
+      reader.cancel().catch(() => {});
+      throw new OzonError('响应过大，请缩小分页大小。');
+    }
+    chunks.push(value);
+  }
+}
+
+const interruption = (error) => (error instanceof OzonError ? error.message
+  : `读取 Ozon 响应时连接中断（${redact([error?.message, error?.cause?.code, error?.cause?.message].filter(Boolean).join('；')).slice(0, 300)}）。`);
+
+// Once the status line has arrived the request has reached Ozon, so for a write a failure while
+// reading or decoding the body leaves the outcome as unknown as a failed fetch does.
+export async function readResponse(response, write, decode) {
+  try {
+    return decode(await readCapped(response));
+  } catch (error) {
+    throw new OzonError(interruption(error) + (write ? WRITE_UNKNOWN : ''));
+  }
+}
+
+// The body of an error status, for the message. It is read the same protected way: when it breaks
+// off, the message says so, and for a write adds that the outcome is unknown (a 502 can arrive
+// after Ozon applied the change) instead of quietly showing nothing.
+export async function readErrorText(response, write, limit) {
+  try {
+    return redact((await readCapped(response)).toString('utf8').slice(0, limit));
+  } catch (error) {
+    return interruption(error) + (write ? WRITE_UNKNOWN : '');
+  }
+}
+
+// A wait never keeps the process alive on its own (the stdio server does that while it serves);
+// `signal` ends it early, rejecting.
+export const sleep = (ms, signal) => wait(ms, undefined, { ref: false, signal });
 
 export async function request(endpoint, body = {}, method = 'POST') {
   const op = findOperation(endpoint, method);
@@ -308,8 +360,20 @@ async function send(op, body, shop, agent) {
   }
 
   const start = performance.now();
-  // Writes are never automatically retried after an ambiguous outcome.
-  for (let attempt = 0; attempt < (op.read_only ? 2 : 1); attempt += 1) {
+  const scope = shop.clientId;
+  // Every send, retries included, goes through the account's shared 429 cooldown and the local
+  // limiter. Only reads retry, at most once and within the account's retry budget; writes are
+  // never retried after an ambiguous outcome.
+  let retryOf = null;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await awaitCooldown(op, scope);
+      admitSend(op, Date.now(), scope);
+    } catch (error) {
+      // A retry the limiter no longer admits after its delay reports the failure that caused it.
+      if (retryOf && error instanceof RateLimitError) throw new OzonError(`${retryOf}，未重试：${error.message}`);
+      throw error;
+    }
     let response;
     const sentAt = performance.now();
     try {
@@ -317,42 +381,41 @@ async function send(op, body, shop, agent) {
         method: op.method, headers, body: payload, redirect: 'manual', dispatcher: agent,
       });
     } catch (error) {
-      throw new OzonError(describeNetworkError(error, performance.now() - sentAt)
-        + (op.read_only ? '' : ' 写入结果未知，请先查询业务状态，不要自动重试。'));
+      throw new OzonError(describeNetworkError(error, performance.now() - sentAt) + (op.read_only ? '' : WRITE_UNKNOWN));
     }
     if (response.status >= 300 && response.status < 400) {
-      await response.body?.cancel().catch(() => {});
+      discardBody(response);
       // Never forward credential headers to a redirected host.
       throw new OzonError(`HTTP ${response.status} ${endpoint}：Ozon 返回重定向，为保护凭证未跟随。`);
     }
     if (!response.ok) {
-      const retryAfter = response.headers.get('retry-after') ?? '2';
-      const delay = Number.isFinite(Number(retryAfter)) ? Math.max(0, Number(retryAfter)) : 2;
-      if (op.read_only && attempt === 0 && [429, 502, 503, 504].includes(response.status) && delay <= 5) {
-        await response.body?.cancel().catch(() => {});
-        await sleep(delay * 1000);
+      const delay = parseRetryAfter(response.headers.get('retry-after')) ?? DEFAULT_RETRY_MS;
+      if (response.status === 429) noteRateLimited(op, scope, delay);
+      if (op.read_only && attempt === 0 && RETRY_STATUSES.has(response.status) && delay <= MAX_RETRY_WAIT_MS
+          && admitRetry(op, scope)) {
+        discardBody(response);
+        retryOf = `HTTP ${response.status} ${endpoint}`;
+        await sleep(withJitter(delay));
         continue;
       }
-      const text = redact((await response.text().catch(() => '')).slice(0, 4096));
+      const text = await readErrorText(response, !op.read_only, 4096);
       let hint = '检查查询参数与官方接口版本。';
       if (response.status === 401 || response.status === 403) hint = '检查密钥有效期、角色权限、允许网络和店铺要约状态。';
       if (response.status === 429) {
         const rule = rateLimitText(op.path);
-        hint = `已触发 Ozon 限流${rule ? `（官方限制：${rule}）` : ''}；Retry-After=${retryAfter} 秒，请告知用户稍后再查。`;
+        hint = `已触发 Ozon 限流${rule ? `（官方限制：${rule}）` : ''}；Retry-After=${Math.ceil(delay / 1000)} 秒，请告知用户稍后再查。`;
       }
       throw new OzonError(`HTTP ${response.status} ${endpoint}：${hint} ${text}`);
     }
-    const raw = await readCapped(response);
-    let data;
-    if ((response.headers.get('content-type') ?? '').toLowerCase().includes('json')) {
+    const contentType = response.headers.get('content-type');
+    const data = await readResponse(response, !op.read_only, (raw) => {
+      if (!(contentType ?? '').toLowerCase().includes('json')) return { content_type: contentType, base64: raw.toString('base64') };
       try {
-        data = parseJson(raw.toString('utf8'));
+        return parseJson(raw.toString('utf8'));
       } catch {
         throw new OzonError('Ozon 返回了无法解析的 JSON。');
       }
-    } else {
-      data = { content_type: response.headers.get('content-type'), base64: raw.toString('base64') };
-    }
+    });
     const result = {
       endpoint,
       ...(multiShop() ? { shop: shop.name } : {}),
@@ -362,8 +425,7 @@ async function send(op, body, shop, agent) {
       rate_limit_remaining: response.headers.get('ratelimit-remaining'),
       data: redact(data),
     };
-    afterSuccess(op, body, result, Date.now(), shop.clientId);
+    afterSuccess(op, body, result, Date.now(), scope);
     return result;
   }
-  throw new OzonError('查询未完成。');
 }

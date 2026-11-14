@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // MCP stdio entry. stdout carries JSON-RPC only; diagnostics go to stderr.
+import { redactText } from '../src/privacy.js';
 import { VERSION } from '../src/version.js';
 
 const args = process.argv.slice(2);
@@ -29,14 +30,15 @@ if (args.includes('--version') || args.includes('-v')) {
 `);
 } else {
   // A stray error must not kill the server mid-conversation; log it to stderr and keep serving.
-  const report = (kind) => (error) => process.stderr.write(`[ozon-seller-mcp] ${kind}: ${error?.stack ?? error}\n`);
+  // Logged text goes through the same redaction as tool results (configured keys, ad tokens).
+  const report = (kind) => (error) => process.stderr.write(`[ozon-seller-mcp] ${kind}: ${redactText(error)}\n`);
   process.on('unhandledRejection', report('unhandledRejection'));
   process.on('uncaughtException', report('uncaughtException'));
   try {
     const { main } = await import('../src/server.js');
     await main();
   } catch (error) {
-    process.stderr.write(`[ozon-seller-mcp] 启动失败：${error?.message ?? error}\n`);
+    process.stderr.write(`[ozon-seller-mcp] 启动失败：${redactText(error?.message ?? error)}\n`);
     process.exit(1);
   }
 }

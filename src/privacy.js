@@ -1,22 +1,24 @@
-const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
-const SECRET_KEYS = new Set(['api-key', 'api_key', 'authorization', 'client_secret', 'access_token']);
+import { allSecrets } from './shops.js';
 
-// Keep credentials out of both upstream error text and tool results.
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const SECRET_KEYS = new Set(['api-key', 'api_key', 'authorization', 'client_secret', 'perf_client_secret', 'access_token']);
+
+// Keep credentials out of both upstream error text and tool results: every shop's secrets,
+// raw and trimmed (the trimmed form is what actually goes on the wire). The secret list is
+// built once per call, not once per string in a large result.
 export function redact(value) {
+  return scrub(value, allSecrets());
+}
+
+function scrub(value, secrets) {
   if (typeof value === 'string') {
-    for (const name of ['OZON_API_KEY', 'OZON_ACCESS_TOKEN', 'OZON_PERF_CLIENT_SECRET']) {
-      const raw = process.env[name] ?? '';
-      // The trimmed form is what actually goes on the wire.
-      for (const secret of new Set([raw, raw.trim()])) {
-        if (secret) value = value.replaceAll(secret, '[已隐藏密钥]');
-      }
-    }
+    for (const secret of secrets) value = value.replaceAll(secret, '[已隐藏密钥]');
     return value;
   }
-  if (Array.isArray(value)) return value.map(redact);
+  if (Array.isArray(value)) return value.map((v) => scrub(v, secrets));
   if (isObject(value)) {
     return Object.fromEntries(Object.entries(value)
-      .map(([k, v]) => [k, SECRET_KEYS.has(String(k).toLowerCase()) ? '[已隐藏]' : redact(v)]));
+      .map(([k, v]) => [k, SECRET_KEYS.has(String(k).toLowerCase()) ? '[已隐藏]' : scrub(v, secrets)]));
   }
   return value;
 }

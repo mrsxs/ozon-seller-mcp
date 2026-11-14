@@ -11,7 +11,11 @@ if (args.includes('--version') || args.includes('-v')) {
 用法：npx -y ozon-seller-mcp
 
 环境变量：
-  OZON_CLIENT_ID, OZON_API_KEY   店铺凭证（必填）
+  OZON_CLIENT_ID, OZON_API_KEY   单店凭证（只有一家店时用）
+  OZON_SHOPS                     多店铺：JSON 数组，每项 {"name","client_id","api_key",
+                                 "perf_client_id"?,"perf_client_secret"?,"access_token"?,"market"?,"default"?}；
+                                 填了它就不再读上面的单店变量。"market": true 的店负责
+                                 类目大盘、全站热搜词（需 Premium Pro）；工具多一个 shop 参数
   OZON_READ_ONLY                 true（默认，只读）/ false（允许写入）
   OZON_TOOLSET                   core（默认）/ all / minimal / 追加接口路径，逗号分隔
   OZON_COMPACT                   true（默认，省略空值字段）/ false
